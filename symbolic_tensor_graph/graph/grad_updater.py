@@ -245,6 +245,33 @@ class MicroBatchReplicator:
         return weights, grads, others
 
     @classmethod
+    def _should_merge_before_sync(cls, grad):
+        if grad.x1 is None:
+            return False
+        if grad.x1_shape is None or grad.x1_hidden is None:
+            return False
+        return grad.x1_shape != grad.x1.y_shape or grad.x1_hidden != grad.x1.y_hidden
+
+    @classmethod
+    def _create_merged_grad(cls, name, revision, grads):
+        assert len(grads) > 0
+        merged_grad = Tensor(create_empty=True)
+        merged_grad.name = name
+        merged_grad.revision = revision
+        merged_grad.require_grads = False
+        merged_grad.op_type = Customized.type_name
+        merged_grad.op_attr = str(Tensor.eval_size(grads[0].y_shape))
+        merged_grad.x1 = grads[0]
+        merged_grad.x1_shape = grads[0].y_shape
+        merged_grad.x1_hidden = grads[0].y_hidden
+        merged_grad.x2_shape = grads[0].y_shape
+        merged_grad.x2_hidden = grads[0].y_hidden
+        merged_grad.extra_attr["data_deps"] = list()
+        for grad in grads[1:]:
+            merged_grad.extra_attr["data_deps"].append(grad)
+        return merged_grad
+
+    @classmethod
     def apply(cls, graph, symbol_map_value, inplace=False):
         # raise NotImplementedError("Too slow, use the postprocess instead")
         batch, microbatch = sp.symbols("Batch MicroBatch")
@@ -256,7 +283,7 @@ class MicroBatchReplicator:
 
         if not inplace:
             graph = copy.deepcopy(graph)
-        weights, grads, others = cls.get_weights_grads_others(graph)
+        weights, grads, _ = cls.get_weights_grads_others(graph)
 
         microbatch_graphs = list()
 
@@ -289,34 +316,37 @@ class MicroBatchReplicator:
                 tensor.x2 = new_weight_map_old_weight[tensor.x2]
 
         old_grad_map_merged_grad = dict()
+        old_grad_map_wrapped_grads = dict()
         for old_grad in old_grad_map_new_grads:
-            merged_grad = Tensor(create_empty=True)
-            merged_grad.name = f"{old_grad.name}"
-            merged_grad.revision = old_grad.revision
-            merged_grad.require_grads = False
-            merged_grad.op_type = Customized.type_name
-            merged_grad.op_attr = str(Tensor.eval_size(old_grad.y_shape))
-            merged_grad.x1 = old_grad_map_new_grads[old_grad][0]
-            merged_grad.x1_shape = old_grad_map_new_grads[old_grad][0].y_shape
-            merged_grad.x1_hidden = old_grad_map_new_grads[old_grad][0].y_hidden
-            merged_grad.x2_shape = old_grad_map_new_grads[old_grad][0].y_shape
-            merged_grad.x2_hidden = old_grad_map_new_grads[old_grad][0].y_hidden
-            merged_grad.extra_attr["data_deps"] = list()
-            for i, new_grad in enumerate(old_grad_map_new_grads[old_grad]):
-                if i == 0:
-                    continue
-                merged_grad.extra_attr["data_deps"].append(new_grad)
+            merge_inputs = old_grad_map_new_grads[old_grad]
+            merge_name = old_grad.name
+            merge_revision = old_grad.revision
+            old_grad_map_wrapped_grads[old_grad] = list()
+            if cls._should_merge_before_sync(old_grad):
+                # Keep per-microbatch gradients local, then let the step-level
+                # weight update trigger a single DP synchronization.
+                merge_inputs = [new_grad.x1 for new_grad in old_grad_map_new_grads[old_grad]]
+                merge_name = old_grad.x1.name
+                merge_revision = old_grad.x1.revision
+                old_grad_map_wrapped_grads[old_grad] = old_grad_map_new_grads[old_grad]
+
+            merged_grad = cls._create_merged_grad(
+                merge_name, merge_revision, merge_inputs
+            )
             old_grad_map_merged_grad[old_grad] = merged_grad
             merged_graph.tensors.append(merged_grad)
             merged_graph.out_tensors.append(merged_grad)
             for new_grad in old_grad_map_new_grads[old_grad]:
                 merged_graph.out_tensors.remove(new_grad)
+            for wrapped_grad in old_grad_map_wrapped_grads[old_grad]:
+                merged_graph.tensors.remove(wrapped_grad)
 
         for old_grad in old_grad_map_new_grads:
             for new_grad in old_grad_map_new_grads[old_grad]:
                 new_weight = new_grad.grad_of
                 old_weight = new_weight_map_old_weight[new_weight]
-                new_grad.grad_of = old_weight
+                if new_grad in merged_graph.tensors:
+                    new_grad.grad_of = old_weight
                 old_weight._grad = old_grad_map_merged_grad[old_grad]
                 merged_graph.tensors.remove(new_weight)
                 merged_graph.in_tensors.remove(new_weight)
