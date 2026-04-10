@@ -2,11 +2,14 @@ import copy
 import typing
 import sympy as sp
 import os
+from collections import defaultdict
+from functools import lru_cache
 from ..ops import Add, PlaceHolder, Customized, Identical
 from ..tensor import Tensor
 from ..graph.graph import TensorGraph, BundledHybridGraph, HybridGraph
 from ..graph.replicate_graph import ReplicateGraph
 from ..graph.connect_graph import ConnectGraph
+from ..chakra.node import Node
 
 
 OPTIMIZED = os.environ.get("STAGE_OPTIMIZED", "1") == "1"
@@ -429,4 +432,312 @@ class MicroBatchReplicatorPostProcess:
             hybrid_graph = bundled_graph.graphs[readable_rank]
             cls.replicate_micro_batches(hybrid_graph, num_micro_batches)
         print("Replicate micro batches done")
+        return bundled_graph
+
+
+class LocalSGDIterationPostProcess:
+    @classmethod
+    def _iteration_key(cls, base_key, iteration):
+        if iteration == 0:
+            return base_key
+        return f"iter{iteration}_{base_key}"
+
+    @classmethod
+    def _iteration_name(cls, base_name, iteration):
+        if iteration == 0:
+            return base_name
+        return f"iter{iteration}.{base_name}"
+
+    @classmethod
+    def _is_sync_iteration(cls, iteration, sync_interval):
+        return sync_interval == 1 or ((iteration + 1) % sync_interval == 0)
+
+    @classmethod
+    def _get_comm_tag_bounds(cls, graph: HybridGraph):
+        min_comm_tag = None
+        max_comm_tag = None
+        for tensor, nodes_this_tensor in graph.tensor_map_nodes.items():
+            for key, node in nodes_this_tensor.items():
+                if node.node_type in {
+                    Node.NodeType.COMM_SEND_NODE,
+                    Node.NodeType.COMM_RECV_NODE,
+                } and hasattr(node, "comm_tag"):
+                    if min_comm_tag is None or node.comm_tag < min_comm_tag:
+                        min_comm_tag = node.comm_tag
+                    if max_comm_tag is None or node.comm_tag > max_comm_tag:
+                        max_comm_tag = node.comm_tag
+        return min_comm_tag, max_comm_tag
+
+    @classmethod
+    def _get_comm_tag_stride(cls, graph: HybridGraph):
+        min_comm_tag, max_comm_tag = cls._get_comm_tag_bounds(graph)
+        if min_comm_tag is not None and max_comm_tag is not None:
+            return max_comm_tag - min_comm_tag + 1
+        return 0
+
+    @classmethod
+    def _get_bundled_comm_tag_stride(cls, bundled_graph):
+        min_comm_tag = None
+        max_comm_tag = None
+        for graph in bundled_graph.graphs.values():
+            graph_min_comm_tag, graph_max_comm_tag = cls._get_comm_tag_bounds(graph)
+            if graph_min_comm_tag is None or graph_max_comm_tag is None:
+                continue
+            if min_comm_tag is None or graph_min_comm_tag < min_comm_tag:
+                min_comm_tag = graph_min_comm_tag
+            if max_comm_tag is None or graph_max_comm_tag > max_comm_tag:
+                max_comm_tag = graph_max_comm_tag
+        if min_comm_tag is not None and max_comm_tag is not None:
+            return max_comm_tag - min_comm_tag + 1
+        return 0
+
+    @classmethod
+    def _freeze_template_nodes(cls, graph: HybridGraph):
+        template_nodes = dict()
+        template_keys = dict()
+        max_node_id = 0
+        for tensor, nodes_this_tensor in graph.tensor_map_nodes.items():
+            template_keys[tensor] = list(nodes_this_tensor.keys())
+            template_nodes[tensor] = dict()
+            for key, node in nodes_this_tensor.items():
+                template_nodes[tensor][key] = copy.deepcopy(node)
+                max_node_id = max(max_node_id, node.id)
+        return template_nodes, template_keys, max_node_id + 1
+
+    @classmethod
+    def _clone_node_for_iteration(cls, node, iteration, node_id_stride, comm_tag_stride):
+        if iteration == 0:
+            return node
+        new_node = copy.deepcopy(node)
+        new_node.name = cls._iteration_name(node.name, iteration)
+        new_node.id = node.id + node_id_stride * iteration
+        new_node.data_deps = [dep + node_id_stride * iteration for dep in node.data_deps]
+        new_node.ctrl_deps = [dep + node_id_stride * iteration for dep in node.ctrl_deps]
+        if (
+            comm_tag_stride > 0
+            and node.node_type
+            in {Node.NodeType.COMM_SEND_NODE, Node.NodeType.COMM_RECV_NODE}
+            and hasattr(new_node, "comm_tag")
+        ):
+            new_node.comm_tag += comm_tag_stride * iteration
+        return new_node
+
+    @classmethod
+    def _get_iteration_node_refs(cls, graph: HybridGraph, template_keys, iteration):
+        node_refs = list()
+        iteration_nodes = dict()
+        for tensor, base_keys in template_keys.items():
+            nodes_this_tensor = graph.tensor_map_nodes[tensor]
+            for base_key in base_keys:
+                iteration_key = cls._iteration_key(base_key, iteration)
+                if iteration_key not in nodes_this_tensor:
+                    continue
+                node = nodes_this_tensor[iteration_key]
+                node_refs.append((tensor, iteration_key, node))
+                iteration_nodes[node.id] = node
+        return node_refs, iteration_nodes
+
+    @classmethod
+    def _remove_non_sync_dp_allreduces(
+        cls, graph: HybridGraph, template_keys, iteration, dp_symbol
+    ):
+        node_refs, iteration_nodes = cls._get_iteration_node_refs(
+            graph, template_keys, iteration
+        )
+        removed_node_ids = {
+            node.id
+            for _, _, node in node_refs
+            if node.node_type == Node.NodeType.COLL_COMM_NODE
+            and node.comm_type == Node.CollectiveType.ALL_REDUCE
+            and getattr(node, "_comm_meta_data", None) is not None
+            and node._comm_meta_data[3] == dp_symbol
+        }
+        if len(removed_node_ids) == 0:
+            return iteration_nodes
+
+        @lru_cache(maxsize=None)
+        def resolve_surviving_parents(node_id):
+            if node_id not in removed_node_ids:
+                return (node_id,)
+            surviving_parents = list()
+            for parent_id in iteration_nodes[node_id].data_deps:
+                for resolved_parent_id in resolve_surviving_parents(parent_id):
+                    if resolved_parent_id not in surviving_parents:
+                        surviving_parents.append(resolved_parent_id)
+            return tuple(surviving_parents)
+
+        for node_id, node in iteration_nodes.items():
+            if node_id in removed_node_ids:
+                continue
+            new_data_deps = list()
+            for parent_id in node.data_deps:
+                for resolved_parent_id in resolve_surviving_parents(parent_id):
+                    if resolved_parent_id not in new_data_deps:
+                        new_data_deps.append(resolved_parent_id)
+            node.data_deps = new_data_deps
+
+        for tensor, iteration_key, node in node_refs:
+            if node.id in removed_node_ids:
+                del graph.tensor_map_nodes[tensor][iteration_key]
+                del iteration_nodes[node.id]
+
+        return iteration_nodes
+
+    @classmethod
+    def _get_iteration_boundary_nodes(cls, iteration_nodes):
+        parent_to_children = defaultdict(set)
+        for node in iteration_nodes.values():
+            for parent_id in node.data_deps:
+                if parent_id in iteration_nodes:
+                    parent_to_children[parent_id].add(node.id)
+
+        source_node_ids = list()
+        sink_node_ids = list()
+        for node in iteration_nodes.values():
+            has_in_iteration_parent = any(
+                parent_id in iteration_nodes for parent_id in node.data_deps
+            )
+            if not has_in_iteration_parent:
+                source_node_ids.append(node.id)
+            if len(parent_to_children[node.id]) == 0:
+                sink_node_ids.append(node.id)
+
+        return source_node_ids, sink_node_ids
+
+    @classmethod
+    def _create_iteration_barrier(cls, barrier_id, prev_iteration, next_iteration, deps):
+        barrier = Node()
+        barrier.node_type = Node.NodeType.COMP_NODE
+        barrier.name = f"iter{prev_iteration}_to_iter{next_iteration}_BARRIER"
+        barrier.id = barrier_id
+        # Keep the barrier as a real executable node so Astra-Sim advances
+        # dependents via the normal callback path instead of treating it as
+        # an invalid zero-size comp node.
+        barrier.num_ops = 16384
+        barrier.tensor_size = 16384
+        barrier.y_tensor_size = 16384
+        barrier.op_type = "barrier"
+        barrier.data_deps = list(deps)
+        barrier.ctrl_deps = list()
+        barrier.inputs = list()
+        barrier.outputs = list()
+        return barrier
+
+    @classmethod
+    def replicate_iterations(
+        cls,
+        graph: HybridGraph,
+        num_iterations,
+        sync_interval,
+        dp_symbol,
+        comm_tag_stride=None,
+        inplace=True,
+    ):
+        if not inplace:
+            graph = copy.deepcopy(graph)
+        if num_iterations < 1:
+            raise ValueError("num_iterations must be at least 1")
+        if sync_interval < 1:
+            raise ValueError("sync_interval must be at least 1")
+        if num_iterations == 1 and sync_interval == 1:
+            return graph
+        if len(graph.tensor_map_nodes) == 0:
+            return graph
+        if comm_tag_stride is None:
+            comm_tag_stride = cls._get_comm_tag_stride(graph)
+
+        (
+            template_nodes,
+            template_keys,
+            node_id_stride,
+        ) = cls._freeze_template_nodes(graph)
+        anchor_tensor = next(iter(graph.tensor_map_nodes.keys()))
+
+        for iteration in range(1, num_iterations):
+            for tensor, base_keys in template_keys.items():
+                nodes_this_tensor = graph.tensor_map_nodes[tensor]
+                for base_key in base_keys:
+                    iteration_key = cls._iteration_key(base_key, iteration)
+                    nodes_this_tensor[iteration_key] = cls._clone_node_for_iteration(
+                        template_nodes[tensor][base_key],
+                        iteration,
+                        node_id_stride,
+                        comm_tag_stride,
+                    )
+
+        iteration_sources = dict()
+        iteration_sinks = dict()
+        for iteration in range(num_iterations):
+            if not cls._is_sync_iteration(iteration, sync_interval):
+                iteration_nodes = cls._remove_non_sync_dp_allreduces(
+                    graph, template_keys, iteration, dp_symbol
+                )
+            else:
+                _, iteration_nodes = cls._get_iteration_node_refs(
+                    graph, template_keys, iteration
+                )
+            sources, sinks = cls._get_iteration_boundary_nodes(iteration_nodes)
+            iteration_sources[iteration] = sources
+            iteration_sinks[iteration] = sinks
+
+        for iteration in range(num_iterations - 1):
+            if len(iteration_sinks[iteration]) == 0:
+                continue
+            if len(iteration_sources[iteration + 1]) == 0:
+                continue
+            barrier_id = node_id_stride * (iteration + 1)
+            barrier = cls._create_iteration_barrier(
+                barrier_id,
+                iteration,
+                iteration + 1,
+                iteration_sinks[iteration],
+            )
+            graph.tensor_map_nodes[anchor_tensor][
+                f"local_sgd_barrier_{iteration}"
+            ] = barrier
+
+            _, next_iteration_nodes = cls._get_iteration_node_refs(
+                graph, template_keys, iteration + 1
+            )
+            for source_id in iteration_sources[iteration + 1]:
+                source_node = next_iteration_nodes[source_id]
+                if barrier_id not in source_node.data_deps:
+                    source_node.data_deps.append(barrier_id)
+
+        return graph
+
+    @classmethod
+    def apply(
+        cls,
+        bundled_graph: BundledHybridGraph,
+        num_iterations,
+        sync_interval,
+        dp_symbol,
+        inplace=True,
+    ):
+        if not inplace:
+            bundled_graph = copy.deepcopy(bundled_graph)
+        if num_iterations == 1 and sync_interval == 1:
+            return bundled_graph
+        print("Applying LocalSGD iteration postprocess")
+        comm_tag_stride = cls._get_bundled_comm_tag_stride(bundled_graph)
+        for readable_rank in bundled_graph.graphs.keys():
+            if OPTIMIZED:
+                is_zero_rank = True
+                for sym, rank in readable_rank:
+                    if sym in bundled_graph.spatial_parallel_dims and rank != 0:
+                        is_zero_rank = False
+                        break
+                if not is_zero_rank:
+                    continue
+            hybrid_graph = bundled_graph.graphs[readable_rank]
+            cls.replicate_iterations(
+                hybrid_graph,
+                num_iterations=num_iterations,
+                sync_interval=sync_interval,
+                dp_symbol=dp_symbol,
+                comm_tag_stride=comm_tag_stride,
+                inplace=True,
+            )
+        print("LocalSGD iteration postprocess done")
         return bundled_graph

@@ -14,6 +14,7 @@ The Symbolic Tensor Graph is a generator for [Chakra Execution Trace (ET)](https
 - Generate synthetic transformer workloads in Chakra ET format.
 - Supports multiple parallelism strategies (DP, TP, PP, SP).
 - Support customized model dimensions for Transformer Models (batch, seq, dmodel, dff, n_head)
+- Can emit multi-iteration LocalSGD traces by keeping DP all-reduce only every K iterations.
 
 ## Installation
 
@@ -59,33 +60,35 @@ comm_group.json  workload.0.et  workload.1.et  workload.2.et  workload.3.et
 
 ## Parameters
 
-    | Argument               | Type    | Required | Default    | Description                                                                 |
-    |------------------------|---------|----------|------------|-----------------------------------------------------------------------------|
-    | --output_dir           | str     | Yes      | -          | Directory to store output traces.                                           |
-    | --output_name          | str     | Yes      | -          | Name of the output traces.                                                  |
-    | --dp                   | int     | No       | 1          | Data parallel degree.                                                       |
-    | --tp                   | int     | No       | 1          | Tensor parallel degree.                                                     |
-    | --sp                   | int     | No       | 1          | Sequence parallel degree.                                                   |
-    | --ep                   | int     | No       | 1          | Expert parallel degree.                                                     |
-    | --pp                   | int     | No       | 1          | Pipeline parallel degree.                                                   |
-    | --weight_sharded       | bool    | No       | False      | Whether weights are sharded.                                                |
-    | --activation_recompute | bool    | No       | False      | Whether to recompute activations.                                           |
-    | --tpsp                 | bool    | No       | True       | Use tensor parallel + sequence parallel or tensor parallel only.            |
-    | --dvocal               | int     | No       | 32000      | Vocabulary size.                                                            |
-    | --dmodel               | int     | No       | 8192       | Model dimension.                                                            |
-    | --dff                  | int     | No       | 28672      | Feed-forward dimension.                                                     |
-    | --batch                | int     | No       | 64         | Batch size.                                                                 |
-    | --micro_batch          | int     | No       | -1         | Micro-batch size. Default is -1 (same as batch size).                       |
-    | --seq                  | int     | No       | 1024       | Sequence length.                                                            |
-    | --head                 | int     | No       | 64         | Number of attention heads.                                                  |
-    | --kvhead               | int     | No       | 8          | Number of key-value heads.                                                  |
-    | --num_stacks           | int     | No       | 80         | Number of transformer layers.                                               |
-    | --experts              | int     | No       | 8          | Number of experts in MoE.                                                   |
-    | --kexperts             | int     | No       | 2          | Number of selected experts per token.                                       |
-    | --chakra_schema_version| str     | No       | "v0.0.4"   | Chakra schema version.                                                      |
-    | --model_type           | str     | No       | "llama"    | Type of model to assemble ("llama", "gpt", "moe", or "debug").              |
-    | --mixed_precision      | bool    | No       | False      | Whether to use mixed precision.                                             |
-    | --print_gpu_vram       | bool    | No       | False      | Whether to print per-GPU VRAM footprint.                                    |
+| Argument | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| --output_dir | str | Yes | - | Directory to store output traces. |
+| --output_name | str | Yes | - | Name of the output traces. |
+| --dp | int | No | 1 | Data parallel degree. |
+| --tp | int | No | 1 | Tensor parallel degree. |
+| --sp | int | No | 1 | Sequence parallel degree. |
+| --ep | int | No | 1 | Expert parallel degree. |
+| --pp | int | No | 1 | Pipeline parallel degree. |
+| --weight_sharded | bool | No | False | Whether weights are sharded. |
+| --activation_recompute | bool | No | False | Whether to recompute activations. |
+| --tpsp | bool | No | True | Use tensor parallel + sequence parallel or tensor parallel only. |
+| --dvocal | int | No | 32000 | Vocabulary size. |
+| --dmodel | int | No | 8192 | Model dimension. |
+| --dff | int | No | 28672 | Feed-forward dimension. |
+| --batch | int | No | 64 | Batch size. |
+| --micro_batch | int | No | -1 | Micro-batch size. Default is -1 (same as batch size). |
+| --num_iterations | int | No | 1 | Number of training iterations to emit into the generated workload. |
+| --dp_local_sgd_interval | int | No | 1 | Keep DP all-reduce every K iterations. `1` keeps synchronous DP behavior. |
+| --seq | int | No | 1024 | Sequence length. |
+| --head | int | No | 64 | Number of attention heads. |
+| --kvhead | int | No | 8 | Number of key-value heads. |
+| --num_stacks | int | No | 80 | Number of transformer layers. |
+| --experts | int | No | 8 | Number of experts in MoE. |
+| --kexperts | int | No | 2 | Number of selected experts per token. |
+| --chakra_schema_version | str | No | "v0.0.4" | Chakra schema version. |
+| --model_type | str | No | "llama" | Type of model to assemble ("llama", "gpt", "moe", or "debug"). |
+| --mixed_precision | bool | No | False | Whether to use mixed precision. |
+| --print_gpu_vram | bool | No | False | Whether to print per-GPU VRAM footprint. |
 
 \*: We do not specify number of total NPUs, which will be infered from the parallel degree as: ```num_NPUs=DP*TP*PP*SP```
 ## Example Commands
@@ -103,6 +106,11 @@ comm_group.json  workload.0.et  workload.1.et  workload.2.et  workload.3.et
 - **Generate with DP=4, TP=4, PP=2, SP=2, FSDP, output in JSON format:**
   ```bash
   python main.py --output_dir generated/ --output_name workload_3.%d.json --comm_group_file comm_group_3.json --dp 4 --tp 4 --pp 2 --sp 2 --weight_sharded 1 --chakra_schema_version json
+  ```
+
+- **Generate a LocalSGD workload with 4 iterations and DP sync every 2 iterations:**
+  ```bash
+  python main.py --output_dir generated_local_sgd/ --output_name workload.%d.et --dp 4 --tp 1 --pp 4 --batch 128 --micro_batch 8 --num_iterations 4 --dp_local_sgd_interval 2
   ```
 
 

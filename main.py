@@ -4,6 +4,7 @@ import sympy as sp
 from symbolic_tensor_graph.graph.graph import TensorGraph
 from symbolic_tensor_graph.graph.grad_updater import (
     GradUpdater,
+    LocalSGDIterationPostProcess,
     MicroBatchReplicator,
     MicroBatchReplicatorPostProcess,
 )
@@ -116,6 +117,21 @@ def _create_pipeline_tensor_map(
     return _tensor_map
 
 
+def _postprocess_chakra_graph(chakra_graph, args, dp):
+    if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
+        chakra_graph = MicroBatchReplicatorPostProcess.apply(
+            chakra_graph, args.batch // args.micro_batch
+        )
+    if args.num_iterations > 1 or args.dp_local_sgd_interval > 1:
+        chakra_graph = LocalSGDIterationPostProcess.apply(
+            chakra_graph,
+            num_iterations=args.num_iterations,
+            sync_interval=args.dp_local_sgd_interval,
+            dp_symbol=dp,
+        )
+    return chakra_graph
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -165,6 +181,20 @@ def main():
     parser.add_argument("--dff", type=int, default=28672, required=False)
     parser.add_argument("--batch", type=int, default=64, required=False)
     parser.add_argument("--micro_batch", type=int, default=-1, required=False)
+    parser.add_argument(
+        "--num_iterations",
+        type=int,
+        default=1,
+        required=False,
+        help="number of training iterations to emit in the workload",
+    )
+    parser.add_argument(
+        "--dp_local_sgd_interval",
+        type=int,
+        default=1,
+        required=False,
+        help="perform DP all-reduce every K iterations; 1 keeps synchronous DP",
+    )
     parser.add_argument("--seq", type=int, default=1024, required=False)
     parser.add_argument("--head", type=int, default=64, required=False)
     parser.add_argument("--kvhead", type=int, default=8, required=False)
@@ -187,6 +217,10 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.num_iterations < 1:
+        raise ValueError("--num_iterations must be at least 1")
+    if args.dp_local_sgd_interval < 1:
+        raise ValueError("--dp_local_sgd_interval must be at least 1")
 
     os.makedirs(args.output_dir, exist_ok=True)
     if not "%d" in args.output_name:
@@ -320,10 +354,9 @@ def main():
             Chakra004Backend as ReadoutBackend,
         )
 
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
-            distributed_chakra_graph_dense = MicroBatchReplicatorPostProcess.apply(
-                distributed_chakra_graph_dense, args.batch // args.micro_batch
-            )
+        distributed_chakra_graph_dense = _postprocess_chakra_graph(
+            distributed_chakra_graph_dense, args, dp
+        )
 
         print("Dense model: reading out")
         distributed_chakra_graph_dense.readout(
@@ -405,10 +438,9 @@ def main():
         )
 
         print("Dense model: reading out")
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
-            distributed_chakra_graph_dense = MicroBatchReplicatorPostProcess.apply(
-                distributed_chakra_graph_dense, args.batch // args.micro_batch
-            )
+        distributed_chakra_graph_dense = _postprocess_chakra_graph(
+            distributed_chakra_graph_dense, args, dp
+        )
         distributed_chakra_graph_dense.readout(
             generated_filename, backend=ReadoutBackend
         )
@@ -487,10 +519,9 @@ def main():
         )
 
         print("MoE model: reading out")
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
-            distributed_chakra_graph_moe = MicroBatchReplicatorPostProcess.apply(
-                distributed_chakra_graph_moe, args.batch // args.micro_batch
-            )
+        distributed_chakra_graph_moe = _postprocess_chakra_graph(
+            distributed_chakra_graph_moe, args, dp
+        )
         distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
 
     elif args.model_type == "debug":
@@ -557,10 +588,9 @@ def main():
         )
 
         print("MoE model: reading out")
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
-            distributed_chakra_graph_moe = MicroBatchReplicatorPostProcess.apply(
-                distributed_chakra_graph_moe, args.batch // args.micro_batch
-            )
+        distributed_chakra_graph_moe = _postprocess_chakra_graph(
+            distributed_chakra_graph_moe, args, dp
+        )
         distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
 
 
