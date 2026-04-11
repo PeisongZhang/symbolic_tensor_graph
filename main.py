@@ -215,6 +215,13 @@ def main():
         required=False,
         help="Whether to print per-GPU VRAM footprint (total / params / acts / grads) in GiB",
     )
+    parser.add_argument(
+        "--flash_attention",
+        type=str_to_bool,
+        default=False,
+        required=False,
+        help="Use FlashAttention kernel with O(S^2) FLOPs and no S×S materialization",
+    )
 
     args = parser.parse_args()
     if args.num_iterations < 1:
@@ -284,7 +291,8 @@ def main():
 
         print("Assembling dense model")
         transformer_dense = transformer_dense(
-            num_stacks, regenerate=True, tpsp=args.tpsp
+            num_stacks, regenerate=True, tpsp=args.tpsp,
+            flash_attention=args.flash_attention,
         )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(
@@ -367,7 +375,8 @@ def main():
 
         print("Assembling dense model")
         transformer_dense = transformer_dense(
-            num_stacks, regenerate=True, tpsp=args.tpsp
+            num_stacks, regenerate=True, tpsp=args.tpsp,
+            flash_attention=args.flash_attention,
         )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(

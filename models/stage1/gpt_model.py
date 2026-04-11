@@ -7,7 +7,7 @@ from symbolic_tensor_graph.graph.graph import TensorGraph
 from symbolic_tensor_graph.ops import Add, PlaceHolder
 
 
-def group_query_attention(GQA_surrounding_path=None, GQA_kernel_path=None, tpsp=True):
+def group_query_attention(GQA_surrounding_path=None, GQA_kernel_path=None, tpsp=True, flash_attention=False):
     if GQA_surrounding_path is None:
         GQA_surrounding_path = "./sharding_spreadsheets/module3/tpsp_gpt/group_query_attention_surrounding.csv"
         if not tpsp:
@@ -15,14 +15,18 @@ def group_query_attention(GQA_surrounding_path=None, GQA_kernel_path=None, tpsp=
                 "./sharding_spreadsheets/module3/tp_gpt/group_query_attention_surrounding.csv"
             )
     if GQA_kernel_path is None:
-        # GQA_kernel_path = (
-        #     "./sharding_spreadsheets/module3/group_query_attention_kernel.csv"
-        # )
-        GQA_kernel_path = "./sharding_spreadsheets/module3/tpsp_gpt/group_query_attention_kernel_fused.csv"
-        if not tpsp:
-            GQA_kernel_path = (
-                "./sharding_spreadsheets/module3/tp_gpt/group_query_attention_kernel_fused.csv"
-            )
+        if flash_attention:
+            GQA_kernel_path = "./sharding_spreadsheets/module3/tpsp_gpt/group_query_attention_kernel_flash.csv"
+            if not tpsp:
+                GQA_kernel_path = (
+                    "./sharding_spreadsheets/module3/tp_gpt/group_query_attention_kernel_flash.csv"
+                )
+        else:
+            GQA_kernel_path = "./sharding_spreadsheets/module3/tpsp_gpt/group_query_attention_kernel_fused.csv"
+            if not tpsp:
+                GQA_kernel_path = (
+                    "./sharding_spreadsheets/module3/tp_gpt/group_query_attention_kernel_fused.csv"
+                )
     GQA_surrounding = TensorGraph.load_tensor_graph(GQA_surrounding_path)
     GQA_kernel = TensorGraph.load_tensor_graph(GQA_kernel_path)
     GQA_kernel = ReplicateGraph.apply(GQA_kernel, "attn_kernel.%s")
@@ -54,7 +58,7 @@ def feed_forward_network(ffn_path=None, tpsp=True):
     return ffn
 
 
-def transformer_decoder_block(ffn_path=None, layernorm_path=None, residual_path=None, tpsp=True):
+def transformer_decoder_block(ffn_path=None, layernorm_path=None, residual_path=None, tpsp=True, flash_attention=False):
     if layernorm_path is None:
         layernorm_path = "./sharding_spreadsheets/module3/tpsp_gpt/layer_norm.csv"
         if not tpsp:
@@ -69,7 +73,7 @@ def transformer_decoder_block(ffn_path=None, layernorm_path=None, residual_path=
     input_layernorm = ReplicateGraph.apply(
         TensorGraph.load_tensor_graph(layernorm_path), "input_norm.%s"
     )
-    mha = ReplicateGraph.apply(group_query_attention(tpsp=tpsp), "mha.%s")
+    mha = ReplicateGraph.apply(group_query_attention(tpsp=tpsp, flash_attention=flash_attention), "mha.%s")
     mha_res = ReplicateGraph.apply(
         TensorGraph.load_tensor_graph(residual_path), "mha_res.%s"
     )
@@ -156,11 +160,11 @@ def transformer_decoders(num_layers, decoder_template, tpsp=True):
     return decoders
 
 
-def gpt(num_layers, embedding_path=None, regenerate=False, tpsp=True):
+def gpt(num_layers, embedding_path=None, regenerate=False, tpsp=True, flash_attention=False):
     from . import CACHE_DIR
     import os
     
-    cache_filename = os.path.join(CACHE_DIR, f"gpt_{num_layers}_{tpsp}.csv")
+    cache_filename = os.path.join(CACHE_DIR, f"gpt_{num_layers}_{tpsp}_fa{int(flash_attention)}.csv")
     if os.path.exists(cache_filename) and not regenerate:
         return TensorGraph.load_tensor_graph(cache_filename)
 
@@ -181,7 +185,7 @@ def gpt(num_layers, embedding_path=None, regenerate=False, tpsp=True):
         old_symbol_map_new_symbol={"Din": "Dmodel", "Dout": "Dvocal"},
     )
 
-    decoder_template = transformer_decoder_block(tpsp=tpsp)
+    decoder_template = transformer_decoder_block(tpsp=tpsp, flash_attention=flash_attention)
     decoders = transformer_decoders(num_layers, decoder_template, tpsp=tpsp)
 
     links = dict()
