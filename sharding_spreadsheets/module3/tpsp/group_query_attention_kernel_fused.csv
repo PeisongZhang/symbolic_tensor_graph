@@ -4,10 +4,10 @@ k,N,,,T,,"Batch/dp, Seq/cp, Dmodel/Head, KVHead/tp",1,,,,
 v,N,,,T,,"Batch/dp, Seq/cp, Dmodel/Head, KVHead/tp",1,,,,
 k1,N,k,,I,,"Batch/dp, Seq, Dmodel/Head, KVHead/tp",1,,,,
 v1,N,v,,I,,"Batch/dp, Seq, Dmodel/Head, KVHead/tp",1,,,,
-qkv,N,q,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*3","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,,"{""data_deps"": [""k1"", ""v1""]}"
+qkv,N,q,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*3+4*Batch/dp*Head/tp*Seq/cp*Seq*Dmodel/Head","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,,"{""data_deps"": [""k1"", ""v1""], ""extra_hbm_bytes"": ""Batch/dp*Head/tp*Seq/cp*Seq*2""}"
 dqkv,N,,,T,,"Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,,,qkv,
-dq,N,dqkv,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*6","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,q,
-dk1,N,dqkv,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*6","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq, Dmodel/Head, Head/tp","1/cp",,
-dv1,N,dqkv,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*6","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq, Dmodel/Head, Head/tp","1/cp",,
+dq,N,dqkv,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*6+4*Batch/dp*Head/tp*Seq/cp*Seq*Dmodel/Head","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,q,"{""extra_hbm_bytes"": ""Batch/dp*Head/tp*Seq/cp*Seq*2""}"
+dk1,N,dqkv,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*6+3*Batch/dp*Head/tp*Seq/cp*Seq*Dmodel/Head","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq, Dmodel/Head, Head/tp","1/cp",,"{""extra_hbm_bytes"": ""Batch/dp*Head/tp*Seq/cp*Seq*2""}"
+dv1,N,dqkv,,CUSTOM,"Batch/dp*Seq/cp*Dmodel/Head*Head/tp*6+3*Batch/dp*Head/tp*Seq/cp*Seq*Dmodel/Head","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,"Batch/dp, Seq, Dmodel/Head, Head/tp","1/cp",,"{""extra_hbm_bytes"": ""Batch/dp*Head/tp*Seq/cp*Seq*2""}"
 dk,N,dk1,,SLICE,"3:KVHead/tp","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,,,k,
 dv,N,dv1,,SLICE,"3:KVHead/tp","Batch/dp, Seq/cp, Dmodel/Head, Head/tp",1,,,v,
