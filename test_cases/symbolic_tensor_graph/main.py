@@ -2,6 +2,7 @@ import sys
 import logging
 import unittest
 from test_tensor import *
+from test_attention_backend import *
 from graph.test_graph import *
 from graph.test_grad_updater import *
 from graph.test_replicate_graph import *

@@ -222,12 +222,29 @@ def main():
         required=False,
         help="Use FlashAttention kernel with O(S^2) FLOPs and no S×S materialization",
     )
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        default="auto",
+        choices=["auto", "standard", "fused", "flash"],
+        required=False,
+        help="Attention kernel backend. 'auto' preserves the legacy --flash_attention behavior.",
+    )
 
     args = parser.parse_args()
     if args.num_iterations < 1:
         raise ValueError("--num_iterations must be at least 1")
     if args.dp_local_sgd_interval < 1:
         raise ValueError("--dp_local_sgd_interval must be at least 1")
+    if args.flash_attention and args.attention_backend not in ("auto", "flash"):
+        raise ValueError(
+            "--flash_attention true cannot be combined with --attention_backend "
+            f"{args.attention_backend}"
+        )
+
+    attention_backend = args.attention_backend
+    if attention_backend == "auto":
+        attention_backend = "flash" if args.flash_attention else "fused"
 
     os.makedirs(args.output_dir, exist_ok=True)
     if not "%d" in args.output_name:
@@ -293,6 +310,7 @@ def main():
         transformer_dense = transformer_dense(
             num_stacks, regenerate=True, tpsp=args.tpsp,
             flash_attention=args.flash_attention,
+            attention_backend=attention_backend,
         )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(
@@ -377,6 +395,7 @@ def main():
         transformer_dense = transformer_dense(
             num_stacks, regenerate=True, tpsp=args.tpsp,
             flash_attention=args.flash_attention,
+            attention_backend=attention_backend,
         )
         if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
             transformer_dense = MicroBatchReplicator.apply(

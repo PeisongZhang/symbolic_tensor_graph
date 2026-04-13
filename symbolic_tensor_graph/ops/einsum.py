@@ -66,6 +66,9 @@ class Einsum(OPBase):
             num_ops *= dim
         for dim in y_hidden:
             num_ops *= dim
+        # Count one multiply and one accumulate for each contraction term.
+        if len(reduced_dims) > 0:
+            num_ops *= 2
         return y_shape, y_hidden, num_ops
 
     @classmethod

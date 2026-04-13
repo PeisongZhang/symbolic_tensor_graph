@@ -1,7 +1,16 @@
 import unittest
+import sympy as sp
 
 
 class TestTensor(unittest.TestCase):
+    def _assert_expr_equal(self, lhs, rhs):
+        self.assertEqual(0, sp.simplify(lhs - rhs))
+
+    def _assert_expr_list_equal(self, lhs, rhs):
+        self.assertEqual(len(lhs), len(rhs))
+        for lhs_item, rhs_item in zip(lhs, rhs):
+            self._assert_expr_equal(lhs_item, rhs_item)
+
     def test_parse_to_records1(self):
         validation_file = "./sharding_spreadsheets/module/linear.csv"
         resave_1_file = "/tmp/TestTensor_test_parse_to_records1_resave1.csv"
@@ -24,17 +33,17 @@ class TestTensor(unittest.TestCase):
         ground_truth = {
             "x": ([B, M], [1], 0),
             "w": ([M, NN], [1], 0),
-            "y": ([B, NN], [M], B * M * NN),
+            "y": ([B, NN], [M], 2 * B * M * NN),
             "dy": ([B, NN], [1], 0),
-            "dw": ([M, NN], [B], B * M * NN),
-            "dx": ([B, M], [NN], B * M * NN),
+            "dw": ([M, NN], [B], 2 * B * M * NN),
+            "dx": ([B, M], [NN], 2 * B * M * NN),
         }
         tensors = Tensor.parse_records(validation_file)
         for tensor in tensors:
             gt_y_shape, gt_y_hidden, gt_ops = ground_truth[tensor.name]
             self.assertEqual(tensor.y_shape, gt_y_shape)
-            self.assertEqual(tensor.y_hidden, gt_y_hidden)
-            self.assertEqual(tensor.ops, gt_ops)
+            self._assert_expr_list_equal(tensor.y_hidden, gt_y_hidden)
+            self._assert_expr_equal(tensor.ops, gt_ops)
 
     def test_parse_to_records2(self):
         validation_file = "./sharding_spreadsheets/test/mlp2.csv"
@@ -58,13 +67,13 @@ class TestTensor(unittest.TestCase):
         ground_truth = {
             "x0": ([B, N0], [1], 0),
             "w1": ([N0, N1], [1], 0),
-            "x1": ([B, N1], [N0], B * N1 * N0),
+            "x1": ([B, N1], [N0], 2 * B * N1 * N0),
             "w2": ([N1, N2], [1], 0),
-            "x2": ([B, N2], [N1], B * N2 * N1),
-            "dx0": ([B, N0], [N1], B * N0 * N1),
-            "dw1": ([N0, N1], [B], B * N0 * N1),
-            "dx1": ([B, N1], [N2], B * N2 * N1),
-            "dw2": ([N1, N2], [B], B * N2 * N1),
+            "x2": ([B, N2], [N1], 2 * B * N2 * N1),
+            "dx0": ([B, N0], [N1], 2 * B * N0 * N1),
+            "dw1": ([N0, N1], [B], 2 * B * N0 * N1),
+            "dx1": ([B, N1], [N2], 2 * B * N2 * N1),
+            "dw2": ([N1, N2], [B], 2 * B * N2 * N1),
             "dx2": ([B, N2], [1], 0),
         }
 
@@ -72,8 +81,8 @@ class TestTensor(unittest.TestCase):
         for tensor in tensors:
             gt_y_shape, gt_y_hidden, gt_ops = ground_truth[tensor.name]
             self.assertEqual(tensor.y_shape, gt_y_shape)
-            self.assertEqual(tensor.y_hidden, gt_y_hidden)
-            self.assertEqual(tensor.ops, gt_ops)
+            self._assert_expr_list_equal(tensor.y_hidden, gt_y_hidden)
+            self._assert_expr_equal(tensor.ops, gt_ops)
 
     def test_op_handler3(self):
         validation_file = "./sharding_spreadsheets/test/test_ops.csv"
@@ -84,7 +93,7 @@ class TestTensor(unittest.TestCase):
         ground_truth = {
             "x": ([B, S, M], [1], 0),
             "w": ([M, M], [1], 0),
-            "y": ([B, S, M], [M], B * S * M * M),
+            "y": ([B, S, M], [M], 2 * B * S * M * M),
             "res": ([B, S, M], [1], B * S * M),
             "norm": ([B, S, M], [1], 5.0 * B * S * M),
             "reshape": ([M * M], [1], M * M),
@@ -94,8 +103,8 @@ class TestTensor(unittest.TestCase):
         for tensor in tensors:
             gt_y_shape, gt_y_hidden, gt_ops = ground_truth[tensor.name]
             self.assertEqual(tensor.y_shape, gt_y_shape)
-            self.assertEqual(tensor.y_hidden, gt_y_hidden)
-            self.assertEqual(tensor.ops, gt_ops)
+            self._assert_expr_list_equal(tensor.y_hidden, gt_y_hidden)
+            self._assert_expr_equal(tensor.ops, gt_ops)
 
     def test_visualize1(self):
         validation_file = "./sharding_spreadsheets/module/linear.csv"
