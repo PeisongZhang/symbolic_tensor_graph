@@ -1,0 +1,11 @@
+id,require_grads,x1,x2,op_type,op_attr,x1_shape,x1_hidden,x2_shape,x2_hidden,grad_of,extra_attr
+q,N,,,T,,"Batch/dp, (Seq/cp)/1, LHeadDim, LKHead/tp",1,,,,
+k,N,,,T,,"Batch/dp, (Seq/cp)/1, LHeadDim, LKHead/tp",1,,,,
+v,N,,,T,,"Batch/dp, (Seq/cp)/1, LHeadDim, LVHead/tp",1,,,,
+k1,N,k,,I,,"Batch/dp, Seq, LHeadDim, LKHead/tp",1,,,,
+v1,N,v,,I,,"Batch/dp, Seq, LHeadDim, LVHead/tp",1,,,,
+qkv,N,q,,CUSTOM,"4*Batch/dp*LKHead/tp*Seq/cp*LHeadDim*LHeadDim","Batch/dp, (Seq/cp)/1, LHeadDim, LKHead/tp",1,"Batch/dp, (Seq/cp)/1, LHeadDim, LVHead/tp",1,,"{""data_deps"": [""k1"", ""v1""]}"
+dqkv,N,,,T,,"Batch/dp, (Seq/cp)/1, LHeadDim, LVHead/tp",1,,,qkv,
+dq,N,dqkv,,CUSTOM,"4*Batch/dp*LKHead/tp*Seq/cp*LHeadDim*LHeadDim","Batch/dp, (Seq/cp)/1, LHeadDim, LVHead/tp",1,"Batch/dp, (Seq/cp)/1, LHeadDim, LKHead/tp",1,q,
+dk,N,dqkv,,CUSTOM,"3*Batch/dp*LKHead/tp*Seq/cp*LHeadDim*LHeadDim","Batch/dp, (Seq/cp)/1, LHeadDim, LVHead/tp",1,"Batch/dp, Seq, LHeadDim, LKHead/tp","1/cp",,
+dv,N,dqkv,,CUSTOM,"3*Batch/dp*LVHead/tp*Seq/cp*LHeadDim*LHeadDim","Batch/dp, (Seq/cp)/1, LHeadDim, LVHead/tp",1,"Batch/dp, Seq, LHeadDim, LVHead/tp","1/cp",,
