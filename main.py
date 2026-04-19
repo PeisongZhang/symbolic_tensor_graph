@@ -120,7 +120,7 @@ def _create_pipeline_tensor_map(
 def _postprocess_chakra_graph(chakra_graph, args, dp):
     if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
         chakra_graph = MicroBatchReplicatorPostProcess.apply(
-            chakra_graph, args.batch // args.micro_batch
+            chakra_graph, args.batch // (args.micro_batch * args.dp)
         )
     if args.num_iterations > 1 or args.dp_local_sgd_interval > 1:
         chakra_graph = LocalSGDIterationPostProcess.apply(
@@ -179,8 +179,13 @@ def main():
     parser.add_argument("--dvocal", type=int, default=32000, required=False)
     parser.add_argument("--dmodel", type=int, default=8192, required=False)
     parser.add_argument("--dff", type=int, default=28672, required=False)
-    parser.add_argument("--batch", type=int, default=64, required=False)
-    parser.add_argument("--micro_batch", type=int, default=-1, required=False)
+    parser.add_argument("--batch", type=int, default=64, required=False,
+                        help="global batch size across all DP ranks")
+    parser.add_argument("--micro_batch", type=int, default=-1, required=False,
+                        help="per-rank micro-batch size (Megatron convention). "
+                             "Number of micro-batches per iteration is "
+                             "batch // (micro_batch * dp). Default -1 means one "
+                             "micro-batch per rank (no gradient accumulation).")
     parser.add_argument(
         "--num_iterations",
         type=int,
@@ -267,14 +272,30 @@ def main():
     ) = sp.symbols(
         "Din Dout Dmodel Dff Batch Seq Head KVHead Experts KExperts Dvocal MicroBatch"
     )
+    # --micro_batch is per-rank (Megatron convention). One iteration produces
+    # batch // (micro_batch * dp) micro-batches. Default -1 -> no grad accum.
     if args.micro_batch == -1:
-        args.micro_batch = args.batch
+        if args.batch % args.dp != 0:
+            raise ValueError(
+                f"--batch ({args.batch}) must be divisible by --dp ({args.dp}) "
+                "when --micro_batch is left at its default"
+            )
+        args.micro_batch = args.batch // args.dp
+    if args.batch % (args.micro_batch * args.dp) != 0:
+        raise ValueError(
+            f"--batch ({args.batch}) must be divisible by "
+            f"--micro_batch ({args.micro_batch}) * --dp ({args.dp})"
+        )
+    # The graph still uses the symbolic shape `Batch/dp` per rank. After
+    # MicroBatchReplicator substitutes Batch -> MicroBatch, each replicated
+    # micro-batch graph evaluates to args.micro_batch samples per rank, which
+    # requires the symbolic MicroBatch value to be (per-rank micro-batch * dp).
     symbol_map_value = {
         Dvocal: args.dvocal,
         Dmodel: args.dmodel,
         Dff: args.dff,
         Batch: args.batch,
-        MicroBatch: args.micro_batch,
+        MicroBatch: args.micro_batch * args.dp,
         Seq: args.seq,
         Head: args.head,
         KVHead: args.kvhead,
