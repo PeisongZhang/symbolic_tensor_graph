@@ -53,34 +53,6 @@ def group_query_attention(
     return GQA
 
 
-def linear_group_query_attention(
-    surrounding_path=None,
-    kernel_path=None,
-):
-    if surrounding_path is None:
-        surrounding_path = (
-            "./sharding_spreadsheets/module3/tpsp_moe/linear_attention_surrounding.csv"
-        )
-    if kernel_path is None:
-        kernel_path = (
-            "./sharding_spreadsheets/module3/tpsp_moe/linear_attention_kernel.csv"
-        )
-    surrounding = TensorGraph.load_tensor_graph(surrounding_path)
-    kernel = TensorGraph.load_tensor_graph(kernel_path)
-    kernel = ReplicateGraph.apply(kernel, "attn_kernel.%s")
-    links = dict()
-    links["q_conv"] = "attn_kernel.q"
-    links["k_conv"] = "attn_kernel.k"
-    links["v"] = "attn_kernel.v"
-    links["attn_kernel.dq"] = "dq_conv"
-    links["attn_kernel.dk"] = "dk_conv"
-    links["attn_kernel.dv"] = "dv"
-    links["attn_kernel.qkv"] = "attn"
-    links["dattn"] = "attn_kernel.dqkv"
-    linear_attn = ConnectGraph.apply([surrounding, kernel], links)
-    return linear_attn
-
-
 def feed_forward_network(ffn_path=None):
     if ffn_path is None:
         ffn_path = "./sharding_spreadsheets/module3/tpsp/llama_feed_forward_network.csv"

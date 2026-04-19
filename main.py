@@ -231,51 +231,6 @@ def main():
         help="Attention kernel backend. 'auto' preserves the legacy --flash_attention behavior.",
     )
 
-    # Qwen3-MoE specific parameters
-    parser.add_argument(
-        "--linear_num_key_heads",
-        type=int,
-        default=0,
-        required=False,
-        help="Number of key/query heads for linear attention layers (0 = disabled)",
-    )
-    parser.add_argument(
-        "--linear_num_value_heads",
-        type=int,
-        default=0,
-        required=False,
-        help="Number of value heads for linear attention layers",
-    )
-    parser.add_argument(
-        "--linear_head_dim",
-        type=int,
-        default=128,
-        required=False,
-        help="Head dimension for linear attention layers",
-    )
-    parser.add_argument(
-        "--conv_kernel_dim",
-        type=int,
-        default=4,
-        required=False,
-        help="Causal conv1d kernel size for linear attention",
-    )
-    parser.add_argument(
-        "--shared_expert_dff",
-        type=int,
-        default=0,
-        required=False,
-        help="Shared expert FFN intermediate dim (0 = no shared expert)",
-    )
-    parser.add_argument(
-        "--layer_types",
-        type=str,
-        default="",
-        required=False,
-        help='Comma-separated attention types per layer, e.g. "linear,linear,linear,full". '
-        "Cycled to match num_stacks.",
-    )
-
     args = parser.parse_args()
     if args.num_iterations < 1:
         raise ValueError("--num_iterations must be at least 1")
@@ -312,9 +267,6 @@ def main():
     ) = sp.symbols(
         "Din Dout Dmodel Dff Batch Seq Head KVHead Experts KExperts Dvocal MicroBatch"
     )
-    LKHead, LVHead, LHeadDim, ConvKernel, SharedDff = sp.symbols(
-        "LKHead LVHead LHeadDim ConvKernel SharedDff"
-    )
     if args.micro_batch == -1:
         args.micro_batch = args.batch
     symbol_map_value = {
@@ -334,13 +286,6 @@ def main():
         spp: args.sp,
         ep: args.ep,
     }
-    if args.linear_num_key_heads > 0:
-        symbol_map_value[LKHead] = args.linear_num_key_heads
-        symbol_map_value[LVHead] = args.linear_num_value_heads
-        symbol_map_value[LHeadDim] = args.linear_head_dim
-        symbol_map_value[ConvKernel] = args.conv_kernel_dim
-    if args.shared_expert_dff > 0:
-        symbol_map_value[SharedDff] = args.shared_expert_dff
     num_stacks = args.num_stacks
     temporal_parallel_dims = [pp]
     if args.weight_sharded:
@@ -606,94 +551,6 @@ def main():
             distributed_chakra_graph_moe, args, dp
         )
         distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
-
-    elif args.model_type == "qwen3_moe":
-        from models.stage1.moe_model import transformer_qwen3 as qwen3_builder
-
-        layer_types_list = None
-        if args.layer_types:
-            layer_types_list = [t.strip() for t in args.layer_types.split(",")]
-
-        assert args.tpsp
-        print("Assembling Qwen3-MoE model")
-        transformer_qwen3 = qwen3_builder(
-            num_stacks,
-            symbol_map_value,
-            layer_types=layer_types_list,
-            shared_expert_dff=args.shared_expert_dff,
-            attention_backend=attention_backend,
-            regenerate=True,
-        )
-        if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") == "0":
-            transformer_qwen3 = MicroBatchReplicator.apply(
-                transformer_qwen3, symbol_map_value
-            )
-        else:
-            print("[Warning] MICROBATCH OPTIMIZE sometimes generate incorrect graphs, use with caution!")
-            assert False, "disable for now"
-        # MicroBatchReplicator already substitutes Batch→MicroBatch for
-        # activation tensors.  A second ReplicateGraph pass with the same
-        # substitution would corrupt CUSTOM op_attr strings (str.replace
-        # matches 'Batch' inside 'MicroBatch').  Weight tensors do not
-        # carry a Batch dimension, so the extra pass is unnecessary.
-
-        if args.weight_sharded:
-            transformer_qwen3 = ReplicateGraph.apply(
-                transformer_qwen3,
-                inplace=True,
-                old_symbol_map_new_symbol={"fsdp": "dp"},
-            )
-        else:
-            transformer_qwen3 = ReplicateGraph.apply(
-                transformer_qwen3, inplace=True, old_symbol_map_new_symbol={"fsdp": 1}
-            )
-
-        transformer_qwen3 = GradUpdater.apply(transformer_qwen3, inplace=True)
-        spatial_parallel_dims = [dp, tp, spp, ep]
-
-        symbol_map_value[tp] *= symbol_map_value[ep]
-
-        pipeline_tensor_map = _create_pipeline_tensor_map(
-            transformer_qwen3.tensors,
-            temporal_parallel_dims,
-            symbol_map_value,
-            num_stacks,
-        )
-
-        print("Qwen3-MoE model: Distributing")
-        distributed = GraphDistributer.apply(
-            transformer_qwen3,
-            symbol_map_value,
-            spatial_parallel_dims,
-            temporal_parallel_dims,
-            pipeline_tensor_map,
-        )
-
-        if args.print_gpu_vram:
-            _print_gpu_vram(
-                distributed,
-                symbol_map_value,
-                mixed_precision=args.mixed_precision,
-                header="[Qwen3-MoE] ",
-            )
-
-        print("Qwen3-MoE model: Converting Chakra")
-        comm_group_file = args.output_name.replace(".%d", "").replace(".et", ".json")
-        distributed_chakra = BundledConvertChakra.apply(
-            distributed,
-            symbol_map_value,
-            os.path.join(args.output_dir, comm_group_file),
-            mixed_precision=args.mixed_precision,
-        )
-
-        from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
-            Chakra004Backend as ReadoutBackend,
-        )
-
-        distributed_chakra = _postprocess_chakra_graph(distributed_chakra, args, dp)
-
-        print("Qwen3-MoE model: reading out")
-        distributed_chakra.readout(generated_filename, backend=ReadoutBackend)
 
     elif args.model_type == "debug":
         transformer_moe = TensorGraph.load_tensor_graph(
