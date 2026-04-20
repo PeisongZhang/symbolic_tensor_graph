@@ -189,6 +189,10 @@ class HybridGraph(TensorGraph):
         X2_COMM = "x2_comm"
         Y_RECV = "y_recv"
         Y_SEND = "y_send"
+        # Post-RECV all-gather added by the scatter/gather optimization (P1-A).
+        # When present, _get_output_node returns this node instead of Y_RECV so
+        # downstream consumers transparently wait for the gathered tensor.
+        Y_RECV_AG = "y_recv_ag"
 
     def __init__(self, tensors, tensor_map_nodes=None, symbol_map_values=None):
         super(HybridGraph, self).__init__(tensors)

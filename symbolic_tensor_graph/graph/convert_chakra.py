@@ -437,6 +437,14 @@ class ConvertChakra:
                     outputs.append(cls._create_IOInfo(tensor, symbol_map_value, mixed_precision, fsdp_enabled))
                     nodes_this_tensor[node_type].inputs = inputs
                     nodes_this_tensor[node_type].outputs = outputs
+                elif node_type == HybridGraph.NodeType.Y_RECV_AG:
+                    # scatter/gather post-RECV all-gather: inputs/outputs mirror
+                    # a regular receive that materializes the full tensor.
+                    inputs = list()
+                    outputs = list()
+                    outputs.append(cls._create_IOInfo(tensor, symbol_map_value, mixed_precision, fsdp_enabled))
+                    nodes_this_tensor[node_type].inputs = inputs
+                    nodes_this_tensor[node_type].outputs = outputs
                 elif HybridGraph.NodeType.Y_SEND in node_type:
                     inputs = list()
                     outputs = list()
@@ -451,6 +459,10 @@ class BundledConvertChakra:
     class _ConvertChakra(ConvertChakra):
         @classmethod
         def _get_output_node(cls, nodes_this_tensor):
+            # Scatter/gather optimization inserts an all-gather downstream of
+            # the RECV; when present, consumers depend on the gathered tensor.
+            if HybridGraph.NodeType.Y_RECV_AG in nodes_this_tensor:
+                return nodes_this_tensor[HybridGraph.NodeType.Y_RECV_AG]
             if HybridGraph.NodeType.Y_RECV in nodes_this_tensor:
                 return nodes_this_tensor[HybridGraph.NodeType.Y_RECV]
             else:
@@ -458,15 +470,20 @@ class BundledConvertChakra:
 
         @classmethod
         def _insert_send_node(
-            cls, tensor, nodes_this_tensor, dst_rank, tag, symbol_map_value, dst_readable_rank=None
+            cls, tensor, nodes_this_tensor, dst_rank, tag, symbol_map_value,
+            dst_readable_rank=None, comm_chunks=1,
         ):
             node = Node()
             node.node_type = Node.NodeType.COMM_SEND_NODE
             node.name = tensor.id + "_Y_SEND"
             node.data_deps.append(cls._get_output_node(nodes_this_tensor).id)
-            node.comm_size = Tensor.eval_expr(
+            full_size = Tensor.eval_expr(
                 Tensor.eval_size(tensor.y_shape), symbol_map_value
             )
+            # Scatter/gather: each TP rank sends only its 1/chunks slice across
+            # the pipeline boundary; the receiver reconstructs via all-gather.
+            assert comm_chunks >= 1
+            node.comm_size = full_size // comm_chunks
             node.comm_tag = tag
             node.comm_dst = dst_rank
             if not dst_readable_rank is None:
@@ -476,21 +493,58 @@ class BundledConvertChakra:
 
         @classmethod
         def _insert_recv_node(
-            cls, tensor, nodes_this_tensor, src_rank, tag, symbol_map_value, src_readable_rank=None
+            cls, tensor, nodes_this_tensor, src_rank, tag, symbol_map_value,
+            src_readable_rank=None, comm_chunks=1,
         ):
             assert tensor.op_type == Shadow.type_name
             node = Node()
             node.node_type = Node.NodeType.COMM_RECV_NODE
             node.name = tensor.id + "_Y_RECV"
-            node.comm_size = Tensor.eval_expr(
+            full_size = Tensor.eval_expr(
                 Tensor.eval_size(tensor.y_shape), symbol_map_value
             )
+            assert comm_chunks >= 1
+            node.comm_size = full_size // comm_chunks
             node.comm_tag = tag
             node.comm_src = src_rank
             if not src_readable_rank is None:
                 node._comm_readable_src = src_readable_rank
             node.y_tensor_size = node.comm_size
             nodes_this_tensor[HybridGraph.NodeType.Y_RECV] = node
+
+        @classmethod
+        def _insert_recv_allgather_node(
+            cls, tensor, nodes_this_tensor, symbol_map_value, tp_comm_group,
+            tp_dim_symbol=None,
+        ):
+            """Append an ALL_GATHER node after Y_RECV for scatter/gather.
+
+            The all-gather runs within the TP group at the receiving PP stage
+            and reconstructs the full tensor from the 1/t slices each TP rank
+            received across the pipeline boundary. `_comm_meta_data` carries the
+            TP dim at index 3 so the late-bound `update_comm_group()` path sets
+            the correct per-rank group id at readout."""
+            assert HybridGraph.NodeType.Y_RECV in nodes_this_tensor
+            recv_node = nodes_this_tensor[HybridGraph.NodeType.Y_RECV]
+            ag_node = Node()
+            ag_node.node_type = Node.NodeType.COLL_COMM_NODE
+            ag_node.name = tensor.id + "_Y_RECV_AG"
+            ag_node.comm_type = Node.CollectiveType.ALL_GATHER
+            ag_node.comm_size = Tensor.eval_expr(
+                Tensor.eval_size(tensor.y_shape), symbol_map_value
+            )
+            ag_node.comm_group = tp_comm_group
+            # Placeholder metadata; only index 3 (parallel_dim) is consulted
+            # during readout's update_comm_group.
+            ag_node._comm_meta_data = (
+                CommunicationMatcherV2.CommType.ALL_GATHER,
+                None,
+                None,
+                tp_dim_symbol,
+            )
+            ag_node.data_deps.append(recv_node.id)
+            ag_node.y_tensor_size = ag_node.comm_size
+            nodes_this_tensor[HybridGraph.NodeType.Y_RECV_AG] = ag_node
 
         @classmethod
         def apply_before_cross_bucket_comms(
@@ -593,6 +647,9 @@ class BundledConvertChakra:
         comm_group_file,
         readable_rank_map_number_rank=None,
         mixed_precision=False,
+        scatter_gather_optimization=False,
+        pp_dim_symbol=None,
+        tp_dim_symbol=None,
     ):
         if not OPTIMIZED:
             return cls.apply_no_optimize(bundled_graph, symbol_map_value, comm_group_file, readable_rank_map_number_rank)
@@ -658,6 +715,38 @@ class BundledConvertChakra:
             print(f"copying from {corresponding_zero_rank} to {asked_readable_rank} before cross bucket")
             buckets[asked_readable_rank] = buckets[corresponding_zero_rank]
 
+        # --- scatter/gather optimization setup (P1-A) ---
+        # Resolve pp / tp dim symbols by string name so the optimization works
+        # regardless of whether callers pass sympy symbols or strings.
+        sg_enabled = scatter_gather_optimization
+        tp_degree = 1
+        if sg_enabled:
+            pp_key = str(pp_dim_symbol) if pp_dim_symbol is not None else "pp"
+            tp_key = str(tp_dim_symbol) if tp_dim_symbol is not None else "tp"
+            # Resolve tp degree from symbol_map_value by string match.
+            for sym, val in symbol_map_value.items():
+                if str(sym) == tp_key:
+                    tp_degree = int(val)
+                    break
+            if tp_degree <= 1:
+                sg_enabled = False
+        else:
+            pp_key = tp_key = None
+
+        def _rank_of(readable_rank, dim_key):
+            for sym, r in readable_rank:
+                if str(sym) == dim_key:
+                    return r
+            return None
+
+        def _is_pp_boundary(remote_rr, shadow_rr):
+            if pp_key is None:
+                return False
+            a = _rank_of(remote_rr, pp_key)
+            b = _rank_of(shadow_rr, pp_key)
+            return a is not None and b is not None and a != b
+
+        sg_links = 0
         tag_cnt = random.randint(0, int(1e6))
         for link in bundled_graph.remote_parent_shadow_pairs:
             (remote_readable_rank, remote_id), (shadow_readable_rank, shadow_id) = link
@@ -667,6 +756,12 @@ class BundledConvertChakra:
             shadow_tensor_nodes = buckets[shadow_readable_rank][0][shadow_tensor]
             remote_num_rank = readable_rank_map_number_rank[remote_readable_rank]
             shadow_num_rank = readable_rank_map_number_rank[shadow_readable_rank]
+
+            this_link_chunks = 1
+            if sg_enabled and _is_pp_boundary(remote_readable_rank, shadow_readable_rank):
+                this_link_chunks = tp_degree
+                sg_links += 1
+
             cls._ConvertChakra._insert_send_node(
                 remote_tensor,
                 remote_tensor_nodes,
@@ -674,6 +769,7 @@ class BundledConvertChakra:
                 tag_cnt,
                 symbol_map_value,
                 shadow_readable_rank,
+                comm_chunks=this_link_chunks,
             )
             cls._ConvertChakra._insert_recv_node(
                 shadow_tensor,
@@ -682,8 +778,32 @@ class BundledConvertChakra:
                 tag_cnt,
                 symbol_map_value,
                 remote_readable_rank,
+                comm_chunks=this_link_chunks,
             )
+
+            if this_link_chunks > 1:
+                # Append an intra-TP all-gather on the receiver side so
+                # downstream consumers see the full tensor.
+                shadow_graph = bundled_graph.graphs[shadow_readable_rank]
+                tp_dim_sym = None
+                for sym in shadow_graph.comm_groups.keys():
+                    if str(sym) == tp_key:
+                        tp_dim_sym = sym
+                        break
+                if tp_dim_sym is not None:
+                    tp_group_id = shadow_graph.comm_groups[tp_dim_sym][0]
+                    cls._ConvertChakra._insert_recv_allgather_node(
+                        shadow_tensor,
+                        shadow_tensor_nodes,
+                        symbol_map_value,
+                        tp_comm_group=tp_group_id,
+                        tp_dim_symbol=tp_dim_sym,
+                    )
+
             tag_cnt += 1
+        if sg_enabled:
+            print(f"scatter/gather optimization applied to {sg_links} pp-boundary links "
+                  f"(tp_degree={tp_degree})")
             
         # optimize
         for asked_readable_rank in bundled_graph.graphs.keys():

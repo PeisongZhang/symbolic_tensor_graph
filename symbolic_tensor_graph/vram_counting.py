@@ -92,7 +92,20 @@ def _tensor_size_bytes(tensor, symbol_map, mixed_precision=False):
     return info["size"]
 
 
-def _print_gpu_vram(bundle_graph, symbol_map, mixed_precision=False, header=""):
+def _print_gpu_vram(bundle_graph, symbol_map, mixed_precision=False, header="",
+                    activation_recompute=False,
+                    activation_recompute_keep_ratio=0.2):
+    """Report per-rank persistent VRAM.
+
+    When activation_recompute=True, stashed activations per stage drop from
+    "all intermediate activations" to roughly "stage input activation". Paper
+    (Megatron-LM §3.5) gives A_input + l/c * A_intermediate; for the common
+    choice c=1 (checkpoint every layer) only stage inputs stay resident. We
+    model this coarsely by scaling the 'acts' bucket by
+    activation_recompute_keep_ratio (default 0.2, tunable). Precise
+    layer-by-layer tracking is deferred to ASTRA-sim's LocalMemUsageTracker
+    (P3-A).
+    """
     GiB = 1024**3
     for rank_key, tg in bundle_graph.graphs.items():
         stats = {"weight": 0, "opt": 0, "act": 0, "grad": 0}
@@ -114,14 +127,22 @@ def _print_gpu_vram(bundle_graph, symbol_map, mixed_precision=False, header=""):
                 tensor_details.append(
                     (cls, size_b, tensor.id, Tensor.stringfy_shape(tensor.y_shape))
                 )
+        acts_full = stats["act"]
+        if activation_recompute:
+            stats["act"] = int(acts_full * activation_recompute_keep_ratio)
         total = sum(stats.values())
         rk_str = ",".join([f"{d[0]}={d[1]}" for d in rank_key])
+        recomp_note = (
+            f" [recomp: acts {acts_full / GiB:.3f}->"
+            f"{stats['act'] / GiB:.3f} @{activation_recompute_keep_ratio}]"
+            if activation_recompute else ""
+        )
         print(
             f"{header}[GPU {rk_str}] total={total / GiB:.3f} GiB | "
             f"weights={stats['weight'] / GiB:.3f} | "
             f"opt={stats['opt'] / GiB:.3f} | "
             f"acts={stats['act'] / GiB:.3f} | "
-            f"grads={stats['grad'] / GiB:.3f}"
+            f"grads={stats['grad'] / GiB:.3f}{recomp_note}"
         )
         # Print top 5 largest tensors by size for this rank
         # tensor_details.sort(key=lambda x: x[1], reverse=True)

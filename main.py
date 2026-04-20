@@ -11,6 +11,8 @@ from symbolic_tensor_graph.graph.grad_updater import (
 from symbolic_tensor_graph.graph.replicate_graph import ReplicateGraph
 from symbolic_tensor_graph.graph.graph_distributer import GraphDistributer
 from symbolic_tensor_graph.graph.convert_chakra import BundledConvertChakra
+from symbolic_tensor_graph.graph.pipeline_schedule import PipelineScheduleInjector
+from symbolic_tensor_graph.graph.activation_recompute import ActivationRecomputePostProcess
 import re
 from symbolic_tensor_graph.vram_counting import _print_gpu_vram
 
@@ -22,105 +24,132 @@ def str_to_bool(v):
     return v.lower() in ("true", "t", "1", "yes", "y")
 
 
+def _build_chunk_cumulative_bounds(num_stacks, num_chunks):
+    """Split num_stacks transformer blocks into num_chunks chunks with remainder
+    distributed to early chunks. Returns cumulative upper bounds (length=num_chunks)."""
+    sizes = [num_stacks // num_chunks] * num_chunks
+    for i in range(num_stacks % num_chunks):
+        sizes[i] += 1
+    cumulative = []
+    acc = 0
+    for s in sizes:
+        acc += s
+        cumulative.append(acc)
+    return cumulative
+
+
+def _block_idx_to_device(block_idx, cumulative, range_):
+    """Given cumulative chunk bounds and pipeline-parallel degree (range_),
+    return the device (pp rank) that owns the given transformer block.
+
+    With num_chunks = len(cumulative) = virtual_stages * range_, consecutive
+    chunks are dealt round-robin to devices: chunk j -> device j % range_.
+    This reproduces contiguous-stage mapping when virtual_stages == 1."""
+    chunk_idx = next(i for i, up in enumerate(cumulative) if block_idx < up)
+    return chunk_idx % range_
+
+
 def _create_pipeline_tensor_map_mix_precision(
-    _tensors, _temporal_parallel_dims, _symbol_map_value, num_stacks
+    _tensors, _temporal_parallel_dims, _symbol_map_value, num_stacks,
+    virtual_stages=1,
 ):
     _tensor_map = dict()
     assert len(_temporal_parallel_dims) == 1
     parallel_dim = _temporal_parallel_dims[0]
     range_ = _symbol_map_value[parallel_dim]
-
-    # Determine how many transformer blocks belong to each pipeline stage
-    num_stacks_each_stage = [num_stacks // range_] * range_
-    for i in range(num_stacks % range_):
-        num_stacks_each_stage[i] += 1  # distribute remainder to early stages
-    # Cumulative upper bounds for easy stage lookup
-    cumulative = []
-    acc = 0
-    for v in num_stacks_each_stage:
-        acc += v
-        cumulative.append(acc)
+    assert virtual_stages >= 1
+    num_chunks = virtual_stages * range_
+    assert num_stacks >= num_chunks, (
+        f"num_stacks ({num_stacks}) must be >= virtual_stages * pp "
+        f"({virtual_stages} * {range_} = {num_chunks})"
+    )
+    cumulative = _build_chunk_cumulative_bounds(num_stacks, num_chunks)
+    # Last transformer block's device — used for out_emb / loss so they stay
+    # on the same device as the final layer regardless of interleaving.
+    last_device = _block_idx_to_device(num_stacks - 1, cumulative, range_)
 
     for tensor in _tensors:
         tid = tensor.id
-        # ------------------------------------------------------------------
-        # 1) Transformer block tensors
-        # ------------------------------------------------------------------
         m = re.search(r"transformer\.(\d+)", tid)
         if m:
             block_idx = int(m.group(1))
-            # Find the first cumulative upper bound that exceeds block_idx
-            stage = next(i for i, up in enumerate(cumulative) if block_idx < up)
-            _tensor_map[tid] = {parallel_dim: stage}
+            device = _block_idx_to_device(block_idx, cumulative, range_)
+            _tensor_map[tid] = {parallel_dim: device}
             continue
 
-        # ------------------------------------------------------------------
-        # 2) Special tensors (embeddings, loss etc.)
-        # ------------------------------------------------------------------
         if "in_emb" in tid:
             _tensor_map[tid] = {parallel_dim: 0}
         elif "out_emb" in tid or "loss" in tid:
-            _tensor_map[tid] = {parallel_dim: (range_ - 1)}
+            _tensor_map[tid] = {parallel_dim: last_device}
         else:
-            # Any tensor that doesn't match the above categories should be
-            # impossible – raise explicit error to catch new patterns early.
             raise ValueError(f"Unrecognized tensor id for pipeline mapping: {tid}")
 
     return _tensor_map
 
 
 def _create_pipeline_tensor_map(
-    _tensors, _temporal_parallel_dims, _symbol_map_value, num_stacks
+    _tensors, _temporal_parallel_dims, _symbol_map_value, num_stacks,
+    virtual_stages=1,
 ):
     if mixprecision:
         return _create_pipeline_tensor_map_mix_precision(
-            _tensors, _temporal_parallel_dims, _symbol_map_value, num_stacks
+            _tensors, _temporal_parallel_dims, _symbol_map_value, num_stacks,
+            virtual_stages=virtual_stages,
         )
     _tensor_map = dict()
     assert len(_temporal_parallel_dims) == 1
     parallel_dim = _temporal_parallel_dims[0]
     range_ = _symbol_map_value[parallel_dim]
-    num_stacks_each_stage = list()
-    for i in range(range_):
-        num_stacks_each_stage.append(num_stacks // range_)
-    for i in range(num_stacks - range_ * (num_stacks // range_)):
-        num_stacks_each_stage[i] += 1
-    for i in range(range_):
-        if i == 0:
-            continue
-        num_stacks_each_stage[i] += num_stacks_each_stage[i - 1]
-    # num_stacks_each_stage.append(num_stacks_each_stage[-1]+100000)
+    assert virtual_stages >= 1
+    num_chunks = virtual_stages * range_
+    assert num_stacks >= num_chunks, (
+        f"num_stacks ({num_stacks}) must be >= virtual_stages * pp "
+        f"({virtual_stages} * {range_} = {num_chunks})"
+    )
+    cumulative = _build_chunk_cumulative_bounds(num_stacks, num_chunks)
+    last_device = _block_idx_to_device(num_stacks - 1, cumulative, range_)
 
     for tensor in _tensors:
-        if tensor.id == "transformer.18._sharded_weight@1":
-            pass
         found = False
         for num_stack in range(num_stacks):
             if f"transformer.{num_stack}." in tensor.id:
-                for stage, upper_bound in enumerate(num_stacks_each_stage):
-                    if num_stack < upper_bound:
-                        _tensor_map[tensor.id] = {parallel_dim: stage}
-                        found = True
-                        break
-                if found:
-                    break
+                device = _block_idx_to_device(num_stack, cumulative, range_)
+                _tensor_map[tensor.id] = {parallel_dim: device}
+                found = True
+                break
         if found:
             pass
         elif "in_emb" in tensor.id:
             _tensor_map[tensor.id] = {parallel_dim: 0}
         elif "out_emb" in tensor.id:
-            _tensor_map[tensor.id] = {parallel_dim: (num_stacks - 1) % range_}
+            _tensor_map[tensor.id] = {parallel_dim: last_device}
         elif "loss" in tensor.id:
-            _tensor_map[tensor.id] = {parallel_dim: (num_stacks - 1) % range_}
+            _tensor_map[tensor.id] = {parallel_dim: last_device}
         else:
             assert False, tensor.name
     return _tensor_map
 
 
-def _postprocess_chakra_graph(chakra_graph, args, dp):
+def _postprocess_chakra_graph(chakra_graph, args, dp, pp):
     if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
         chakra_graph = MicroBatchReplicatorPostProcess.apply(
             chakra_graph, args.batch // (args.micro_batch * args.dp)
+        )
+    # Inflate backward compute to cover the extra forward pass under
+    # activation recomputation (P1-B). Run before schedule injection so that
+    # ctrl_deps target the already-inflated nodes.
+    if args.activation_recompute:
+        chakra_graph = ActivationRecomputePostProcess.apply(chakra_graph)
+    # Inject explicit pipeline-schedule ctrl_deps (no-op for 'natural').
+    if args.pipeline_schedule != "natural" and args.pp > 1:
+        num_mb = args.batch // (args.micro_batch * args.dp)
+        chakra_graph = PipelineScheduleInjector.apply(
+            chakra_graph,
+            schedule=args.pipeline_schedule,
+            num_micro_batches=num_mb,
+            pipeline_parallel_size=args.pp,
+            virtual_stages=args.pipeline_virtual_stages,
+            pp_dim_symbol=pp,
         )
     if args.num_iterations > 1 or args.dp_local_sgd_interval > 1:
         chakra_graph = LocalSGDIterationPostProcess.apply(
@@ -154,6 +183,38 @@ def main():
     )
     parser.add_argument(
         "--pp", type=int, default=1, help="pipeline parallel degree", required=False
+    )
+    parser.add_argument(
+        "--pipeline_virtual_stages",
+        type=int,
+        default=1,
+        required=False,
+        help="Number of virtual pipeline stages (model chunks) per device. "
+             "v=1 is the standard contiguous mapping; v>1 enables Megatron-LM "
+             "interleaved pipeline where each device holds v non-contiguous "
+             "chunks. Requires num_stacks %% (v * pp) == 0.",
+    )
+    parser.add_argument(
+        "--pipeline_schedule",
+        type=str,
+        default="natural",
+        required=False,
+        choices=list(PipelineScheduleInjector.VALID_SCHEDULES),
+        help="Pipeline scheduling strategy. 'natural' leaves execution "
+             "dependency-driven (legacy behavior). 'gpipe' forces all "
+             "forward passes before any backward pass. '1f1b' uses Megatron/"
+             "PipeDream-Flush warmup-steady-cooldown ordering. "
+             "'1f1b-interleaved' adds chunk-level interleaving for v>1.",
+    )
+    parser.add_argument(
+        "--scatter_gather_optimization",
+        type=str_to_bool,
+        default=False,
+        required=False,
+        help="Enable Megatron-LM scatter/gather optimization across pipeline "
+             "stage boundaries (§4.1). Each TP rank sends only a 1/t slice "
+             "across the inter-node link; the receiver reconstructs the full "
+             "tensor via an intra-TP all-gather. Only active when tp > 1.",
     )
     parser.add_argument(
         "--weight_sharded",
@@ -241,6 +302,19 @@ def main():
         raise ValueError("--num_iterations must be at least 1")
     if args.dp_local_sgd_interval < 1:
         raise ValueError("--dp_local_sgd_interval must be at least 1")
+    if args.pipeline_virtual_stages < 1:
+        raise ValueError("--pipeline_virtual_stages must be at least 1")
+    # Divisibility is only strictly required for clean interleaved scheduling.
+    # v=1 (contiguous mapping) tolerates remainders, matching legacy behavior.
+    if args.pipeline_virtual_stages > 1 and \
+       args.num_stacks % (args.pipeline_virtual_stages * args.pp) != 0:
+        raise ValueError(
+            f"--num_stacks ({args.num_stacks}) must be divisible by "
+            f"--pipeline_virtual_stages ({args.pipeline_virtual_stages}) * "
+            f"--pp ({args.pp}) = "
+            f"{args.pipeline_virtual_stages * args.pp} "
+            "when using interleaved pipeline (v > 1)"
+        )
     if args.flash_attention and args.attention_backend not in ("auto", "flash"):
         raise ValueError(
             "--flash_attention true cannot be combined with --attention_backend "
@@ -369,6 +443,7 @@ def main():
             temporal_parallel_dims,
             symbol_map_value,
             num_stacks,
+            virtual_stages=args.pipeline_virtual_stages,
         )
 
         print("Dense model: Distributing")
@@ -386,6 +461,7 @@ def main():
                 symbol_map_value,
                 mixed_precision=args.mixed_precision,
                 header="[Dense] ",
+                activation_recompute=args.activation_recompute,
             )
 
         print("Dense model: Converting Chakra")
@@ -395,6 +471,9 @@ def main():
             symbol_map_value,
             os.path.join(args.output_dir, comm_group_file),
             mixed_precision=args.mixed_precision,
+            scatter_gather_optimization=args.scatter_gather_optimization,
+            pp_dim_symbol=pp,
+            tp_dim_symbol=tp,
         )
 
         from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
@@ -402,7 +481,7 @@ def main():
         )
 
         distributed_chakra_graph_dense = _postprocess_chakra_graph(
-            distributed_chakra_graph_dense, args, dp
+            distributed_chakra_graph_dense, args, dp, pp
         )
 
         print("Dense model: reading out")
@@ -454,6 +533,7 @@ def main():
             temporal_parallel_dims,
             symbol_map_value,
             num_stacks,
+            virtual_stages=args.pipeline_virtual_stages,
         )
 
         print("Dense model: Distributing")
@@ -480,6 +560,9 @@ def main():
             symbol_map_value,
             os.path.join(args.output_dir, comm_group_file),
             mixed_precision=args.mixed_precision,
+            scatter_gather_optimization=args.scatter_gather_optimization,
+            pp_dim_symbol=pp,
+            tp_dim_symbol=tp,
         )
 
         from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
@@ -488,7 +571,7 @@ def main():
 
         print("Dense model: reading out")
         distributed_chakra_graph_dense = _postprocess_chakra_graph(
-            distributed_chakra_graph_dense, args, dp
+            distributed_chakra_graph_dense, args, dp, pp
         )
         distributed_chakra_graph_dense.readout(
             generated_filename, backend=ReadoutBackend
@@ -535,6 +618,7 @@ def main():
             temporal_parallel_dims,
             symbol_map_value,
             num_stacks,
+            virtual_stages=args.pipeline_virtual_stages,
         )
 
         print("MoE model: Distributing")
@@ -552,6 +636,7 @@ def main():
                 symbol_map_value,
                 mixed_precision=args.mixed_precision,
                 header="[MoE] ",
+                activation_recompute=args.activation_recompute,
             )
 
         print("MoE model: Converting Chakra")
@@ -561,6 +646,9 @@ def main():
             symbol_map_value,
             os.path.join(args.output_dir, comm_group_file),
             mixed_precision=args.mixed_precision,
+            scatter_gather_optimization=args.scatter_gather_optimization,
+            pp_dim_symbol=pp,
+            tp_dim_symbol=tp,
         )
 
         from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
@@ -569,7 +657,7 @@ def main():
 
         print("MoE model: reading out")
         distributed_chakra_graph_moe = _postprocess_chakra_graph(
-            distributed_chakra_graph_moe, args, dp
+            distributed_chakra_graph_moe, args, dp, pp
         )
         distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
 
@@ -630,6 +718,9 @@ def main():
             distributed_tensor_graph_moe,
             symbol_map_value,
             os.path.join(args.output_dir, comm_group_file),
+            scatter_gather_optimization=args.scatter_gather_optimization,
+            pp_dim_symbol=pp,
+            tp_dim_symbol=tp,
         )
 
         from symbolic_tensor_graph.chakra.backends.chakra_00_4_backend import (
@@ -638,7 +729,7 @@ def main():
 
         print("MoE model: reading out")
         distributed_chakra_graph_moe = _postprocess_chakra_graph(
-            distributed_chakra_graph_moe, args, dp
+            distributed_chakra_graph_moe, args, dp, pp
         )
         distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
 
