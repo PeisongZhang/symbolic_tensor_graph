@@ -30,9 +30,13 @@ Design notes:
 import re
 from collections import defaultdict
 
+from ..chakra.node import Node
+
 
 _MB_PREFIX_RE = re.compile(r"^mb(\d+)\.")
 _TENSOR_NAME_RE = re.compile(r"\.([A-Za-z_][A-Za-z_0-9]*)@")
+_TRANSFORMER_BLOCK_RE = re.compile(r"transformer\.(\d+)\.")
+_SHADOW_PREFIX = "shadow_"
 
 
 # Phase enumeration --------------------------------------------------------
@@ -243,73 +247,149 @@ def _apply_1f1b_to_rank(hybrid_graph, num_mb, p, rank):
 
 
 def _build_1f1b_interleaved_sequence(num_mb, p, v, rank):
-    """Build 1F1B-interleaved action sequence.
+    """Build 1F1B-interleaved action sequence per Megatron-LM.
 
-    With v virtual stages per device and p devices, there are v*p total chunks.
-    Each mb goes through v*p chunks in forward and v*p in backward; each device
-    sees v chunks per mb per direction. The interleaved 1F1B keeps a steady
-    state with the same flush behavior as 1F1B but operating on chunks.
+    Follows the convention used by
+    ``megatron.core.pipeline_parallel.schedules.forward_backward_pipelining_with_interleaving``:
 
-    The sequence is parameterized by (chunk_on_device_id, phase, mb_idx). For
-    simulation purposes we use the chunk index (0..v-1) as a secondary label;
-    consumers of this sequence must be able to map the chunk id back to the
-    actual nodes that belong to that chunk on this device.
+        microbatch_id_in_group  = k % (p * v)
+        model_chunk_id          = microbatch_id_in_group // p
+        microbatch_id           = (k // (p * v)) * p + (k % p)
 
-    Returns list of (phase, mb_idx, chunk_on_device).
+    Backward chunks traverse chunks in reverse (``v - 1 - chunk``) while the
+    microbatch mapping stays the same.
+
+    Warmup (before the first backward) is
+        (p - rank - 1) * 2 + (v - 1) * p
+    clipped to ``v * num_mb`` (the total number of forward chunks on this
+    device).
+
+    Requires ``num_mb % p == 0`` so that chunk/mb indices stay in range; this
+    mirrors Megatron's own requirement.
+
+    Returns list of ``(phase, mb_idx, chunk_on_device)`` triples.
     """
-    # For each device, there are v*num_mb F-chunks and v*num_mb B-chunks.
-    # Warmup count = (v - 1) * p + 2 * (p - rank) - 1, capped by available.
-    # See Megatron paper §2.2.2. We use the simplified formulation:
-    #   warmup_chunks = (p - rank - 1) + (v - 1) * p   (from the paper's
-    #   derivation t_pb^int = (p-1)*(t_f + t_b)/v)
-    # but in practice we round to at most v*num_mb F chunks.
-    total_f = v * num_mb
-    total_b = v * num_mb
-    warmup = min(total_f, (p - rank - 1) + (v - 1) * p + 1)
-    steady = max(0, total_f - warmup)
+    assert v >= 1 and p >= 1 and num_mb >= 1
+    if v > 1 and num_mb % p != 0:
+        raise ValueError(
+            f"1f1b-interleaved requires num_micro_batches ({num_mb}) to be a "
+            f"multiple of pipeline_parallel_size ({p})"
+        )
+    total_steps = v * num_mb
+    warmup = (p - rank - 1) * 2 + (v - 1) * p
+    warmup = max(0, min(total_steps, warmup))
+    steady = total_steps - warmup
+
+    def f_mb_chunk(k):
+        mb = (k // (p * v)) * p + (k % p)
+        chunk = (k % (p * v)) // p
+        return mb, chunk
+
+    def b_mb_chunk(k):
+        mb, ch = f_mb_chunk(k)
+        return mb, v - 1 - ch
 
     seq = []
-    # Warmup: first `warmup` F chunks of the (mb, chunk) cartesian order.
-    # Chunk execution order on one device is (chunk_on_device=0 for mb 0..m-1),
-    # then (chunk=1 for mb 0..m-1), etc.
-    def f_idx_to_mb_chunk(f_idx):
-        return (f_idx // v, f_idx % v)
-    def b_idx_to_mb_chunk(b_idx):
-        # Backward order: reverse chunk (v-1 first), then mb forward.
-        chunk_on_device = v - 1 - (b_idx // num_mb)
-        mb = b_idx % num_mb
-        return (mb, chunk_on_device)
-
-    for i in range(warmup):
-        mb, ch = f_idx_to_mb_chunk(i)
+    for k in range(warmup):
+        mb, ch = f_mb_chunk(k)
         seq.append((PHASE_F, mb, ch))
-    for i in range(steady):
-        mb_b, ch_b = b_idx_to_mb_chunk(i)
-        mb_f, ch_f = f_idx_to_mb_chunk(warmup + i)
-        seq.append((PHASE_B, mb_b, ch_b))
+    # Steady phase: 1 F of the next mb, then 1 B of an earlier mb.
+    # On rank p-1 the first B in steady is B(mb=0, chunk=v-1); the matching
+    # F(mb=0, chunk=v-1) only runs at steady k=0's F slot, so F must precede
+    # B or the last rank deadlocks (B fires before its own F ever ran).
+    for k in range(steady):
+        mb_f, ch_f = f_mb_chunk(warmup + k)
+        mb_b, ch_b = b_mb_chunk(k)
         seq.append((PHASE_F, mb_f, ch_f))
-    for i in range(steady, total_b):
-        mb_b, ch_b = b_idx_to_mb_chunk(i)
+        seq.append((PHASE_B, mb_b, ch_b))
+    for k in range(steady, total_steps):
+        mb_b, ch_b = b_mb_chunk(k)
         seq.append((PHASE_B, mb_b, ch_b))
     return seq
 
 
-def _apply_1f1b_interleaved_to_rank(hybrid_graph, num_mb, p, v, rank):
-    """Chunk-granularity 1F1B for interleaved pipeline.
+def _classify_chunk_on_device(node_name, block_to_chunk_local, virtual_stages):
+    """Return the chunk-on-device (``0..v-1``) the node belongs to, or None.
 
-    Note: robust chunk-on-device detection requires the interleaved mapping
-    metadata (which block belongs to which chunk-on-device). This is derivable
-    from `num_stacks`, `p`, `v`, and the standard round-robin rule. For V1 we
-    fall back to a coarser per-mb ordering that still enforces interleaved
-    1F1B at mb granularity, which is enough to exercise the critical path.
-
-    TODO: upgrade to true chunk-level scheduling once block->chunk metadata is
-    plumbed to this post-process.
+    Classification rules:
+      - transformer.{N}.*  -> ``block_to_chunk_local[N]``
+      - in_emb             -> 0 (first chunk on device 0)
+      - out_emb / loss     -> ``v - 1`` (last chunk on device p-1)
+      - shadow_*           -> None (these flow via data_deps from their
+                                     producer on another rank; classifying
+                                     them would pin the receive to the source
+                                     rank's chunk which is meaningless here)
     """
-    # Fall back to the non-interleaved 1F1B schedule at mb granularity for now.
-    # The interleaved benefit already manifests via the non-contiguous
-    # block->device mapping established in main._create_pipeline_tensor_map.
-    _apply_1f1b_to_rank(hybrid_graph, num_mb, p, rank)
+    if node_name.startswith(_SHADOW_PREFIX):
+        return None
+    m = _TRANSFORMER_BLOCK_RE.search(node_name)
+    if m is not None:
+        block_idx = int(m.group(1))
+        return block_to_chunk_local.get(block_idx)
+    if "in_emb" in node_name:
+        return 0
+    if "out_emb" in node_name or "loss" in node_name:
+        return virtual_stages - 1
+    return None
+
+
+def _partition_nodes_interleaved(hybrid_graph, block_to_chunk_local,
+                                 virtual_stages):
+    """Group COMP nodes by ``(mb_idx, phase, chunk_on_device)``.
+
+    Only COMP nodes participate in the partition: SEND/RECV/coll-comm nodes
+    are ordered transitively through their data_deps on the COMP nodes, and
+    we want them free to overlap with compute on adjacent chunks rather than
+    being pinned to the chunk they happen to be named after.
+    """
+    partitions = defaultdict(list)
+    for node in _iter_nodes(hybrid_graph):
+        if node.node_type != Node.NodeType.COMP_NODE:
+            continue
+        mb = _extract_mb_index(node.name)
+        if mb is None:
+            continue
+        phase = _classify_phase(node.name)
+        if phase == PHASE_U:
+            continue
+        chunk = _classify_chunk_on_device(
+            node.name, block_to_chunk_local, virtual_stages,
+        )
+        if chunk is None:
+            continue
+        partitions[(mb, phase, chunk)].append(node)
+    for lst in partitions.values():
+        lst.sort(key=lambda n: n.id)
+    return partitions
+
+
+def _apply_1f1b_interleaved_to_rank(hybrid_graph, num_mb, p, v, rank,
+                                    block_to_chunk_local):
+    """Chunk-granularity 1F1B schedule injection.
+
+    Requires ``block_to_chunk_local`` — a ``dict[block_idx -> chunk_on_device]``
+    — so that COMP nodes can be partitioned by ``(mb, phase, chunk_on_device)``.
+    Falls back to plain 1F1B at mb granularity when ``v <= 1`` or the metadata
+    is missing (mirrors the prior behavior for non-interleaved usage).
+    """
+    if v <= 1 or not block_to_chunk_local:
+        return _apply_1f1b_to_rank(hybrid_graph, num_mb, p, rank)
+
+    seq = _build_1f1b_interleaved_sequence(num_mb, p, v, rank)
+    parts = _partition_nodes_interleaved(
+        hybrid_graph, block_to_chunk_local, v,
+    )
+    bounds = _boundary_node_ids(parts)
+
+    prev = None
+    for phase, mb, chunk in seq:
+        key = (mb, phase, chunk)
+        if key not in bounds:
+            continue
+        first_id, last_id = bounds[key]
+        if prev is not None:
+            _add_ctrl_edge(hybrid_graph, prev, first_id)
+        prev = last_id
 
 
 # Public API ---------------------------------------------------------------
@@ -325,6 +405,7 @@ class PipelineScheduleInjector:
         pipeline_parallel_size,
         virtual_stages=1,
         pp_dim_symbol=None,
+        block_to_chunk_local=None,
     ):
         """Inject ctrl_deps into each rank's HybridGraph per `schedule`.
 
@@ -336,6 +417,9 @@ class PipelineScheduleInjector:
             virtual_stages: v (>=1). Used only for 1f1b-interleaved.
             pp_dim_symbol: sympy symbol or string that identifies the pipeline
                 dimension inside readable_rank tuples. Defaults to string 'pp'.
+            block_to_chunk_local: dict[block_idx -> chunk_on_device]. Required
+                for '1f1b-interleaved' with virtual_stages > 1; produced by
+                main._create_pipeline_tensor_map[_mix_precision].
 
         Returns bundled_graph (modified in place).
         """
@@ -369,6 +453,7 @@ class PipelineScheduleInjector:
                 _apply_1f1b_interleaved_to_rank(
                     hybrid_graph, num_micro_batches,
                     pipeline_parallel_size, virtual_stages, rank,
+                    block_to_chunk_local,
                 )
         print("Pipeline schedule applied")
         return bundled_graph

@@ -15,6 +15,40 @@ class Chakra004Backend(NodeBackendBase):
     SCHEMA = "Chakra v0.0.4"
     DEFAULT_NETWORK_DIM = 0
 
+    # correctness_todo.md §4 — op_category values read by ASTRA-sim's Roofline
+    # for per-op-type peak performance. Keep in sync with:
+    #   astra-sim/astra-sim/system/Roofline.hh (kOpCat* constants).
+    # STG op_type letter codes come from symbolic_tensor_graph.ops.* type_name.
+    OP_CATEGORY_GEMM = 0
+    OP_CATEGORY_ELEMWISE = 1
+    OP_CATEGORY_SOFTMAX = 2
+    OP_CATEGORY_REDUCE = 3
+    OP_CATEGORY_OTHER = 4
+
+    _OP_TYPE_TO_CATEGORY = {
+        # matrix multiply / einsum — GEMM
+        "M": OP_CATEGORY_GEMM,
+        # element-wise arithmetic
+        "A": OP_CATEGORY_ELEMWISE,
+        "E": OP_CATEGORY_ELEMWISE,
+        "E2": OP_CATEGORY_ELEMWISE,
+        "C": OP_CATEGORY_ELEMWISE,
+        # attention / softmax fused kernel
+        "CUSTOM": OP_CATEGORY_SOFTMAX,
+        # broadcast/reduce (softmax normalization, layernorm reduce etc.)
+        "B": OP_CATEGORY_REDUCE,
+        # no-op / layout ops — no compute contribution
+        "I": OP_CATEGORY_OTHER,
+        "R": OP_CATEGORY_OTHER,
+        "S": OP_CATEGORY_OTHER,
+        "T": OP_CATEGORY_OTHER,
+        "SLICE": OP_CATEGORY_OTHER,
+    }
+
+    @classmethod
+    def _op_type_to_category(cls, op_type):
+        return cls._OP_TYPE_TO_CATEGORY.get(str(op_type), cls.OP_CATEGORY_OTHER)
+
     @classmethod
     def get_global_metadata_node(cls):
         node = GlobalMetadata()
@@ -96,6 +130,11 @@ class Chakra004Backend(NodeBackendBase):
             ChakraAttr(name="tensor_size", uint64_val=int(tensor_size))
         )
         backend_node.attr.append(ChakraAttr(name="op_type", string_val=str(op_type)))
+        # correctness_todo.md §4 — emit op_category for per-op-type Roofline.
+        backend_node.attr.append(
+            ChakraAttr(name="op_category",
+                       int32_val=cls._op_type_to_category(op_type))
+        )
 
     @classmethod
     def set_coll_comm_attrs(cls, comm_size, comm_type, comm_group, backend_node):

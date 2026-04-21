@@ -68,6 +68,11 @@ def _create_pipeline_tensor_map_mix_precision(
     # on the same device as the final layer regardless of interleaving.
     last_device = _block_idx_to_device(num_stacks - 1, cumulative, range_)
 
+    block_to_chunk_local = {}
+    for block_idx in range(num_stacks):
+        chunk_idx = next(i for i, up in enumerate(cumulative) if block_idx < up)
+        block_to_chunk_local[block_idx] = chunk_idx // range_
+
     for tensor in _tensors:
         tid = tensor.id
         m = re.search(r"transformer\.(\d+)", tid)
@@ -84,7 +89,7 @@ def _create_pipeline_tensor_map_mix_precision(
         else:
             raise ValueError(f"Unrecognized tensor id for pipeline mapping: {tid}")
 
-    return _tensor_map
+    return _tensor_map, block_to_chunk_local
 
 
 def _create_pipeline_tensor_map(
@@ -109,6 +114,11 @@ def _create_pipeline_tensor_map(
     cumulative = _build_chunk_cumulative_bounds(num_stacks, num_chunks)
     last_device = _block_idx_to_device(num_stacks - 1, cumulative, range_)
 
+    block_to_chunk_local = {}
+    for block_idx in range(num_stacks):
+        chunk_idx = next(i for i, up in enumerate(cumulative) if block_idx < up)
+        block_to_chunk_local[block_idx] = chunk_idx // range_
+
     for tensor in _tensors:
         found = False
         for num_stack in range(num_stacks):
@@ -127,10 +137,10 @@ def _create_pipeline_tensor_map(
             _tensor_map[tensor.id] = {parallel_dim: last_device}
         else:
             assert False, tensor.name
-    return _tensor_map
+    return _tensor_map, block_to_chunk_local
 
 
-def _postprocess_chakra_graph(chakra_graph, args, dp, pp):
+def _postprocess_chakra_graph(chakra_graph, args, dp, pp, block_to_chunk_local=None):
     if os.environ.get("STAGE_MICROBATCH_OPTIMIZE", "0") != "0":
         chakra_graph = MicroBatchReplicatorPostProcess.apply(
             chakra_graph, args.batch // (args.micro_batch * args.dp)
@@ -150,6 +160,7 @@ def _postprocess_chakra_graph(chakra_graph, args, dp, pp):
             pipeline_parallel_size=args.pp,
             virtual_stages=args.pipeline_virtual_stages,
             pp_dim_symbol=pp,
+            block_to_chunk_local=block_to_chunk_local,
         )
     if args.num_iterations > 1 or args.dp_local_sgd_interval > 1:
         chakra_graph = LocalSGDIterationPostProcess.apply(
@@ -438,7 +449,7 @@ def main():
 
         symbol_map_value[tp] *= symbol_map_value[ep]
         # dense model
-        pipeline_tensor_map = _create_pipeline_tensor_map(
+        pipeline_tensor_map, block_to_chunk_local = _create_pipeline_tensor_map(
             transformer_dense.tensors,
             temporal_parallel_dims,
             symbol_map_value,
@@ -481,7 +492,8 @@ def main():
         )
 
         distributed_chakra_graph_dense = _postprocess_chakra_graph(
-            distributed_chakra_graph_dense, args, dp, pp
+            distributed_chakra_graph_dense, args, dp, pp,
+            block_to_chunk_local=block_to_chunk_local,
         )
 
         print("Dense model: reading out")
@@ -528,7 +540,7 @@ def main():
 
         symbol_map_value[tp] *= symbol_map_value[ep]
         # dense model
-        pipeline_tensor_map = _create_pipeline_tensor_map(
+        pipeline_tensor_map, block_to_chunk_local = _create_pipeline_tensor_map(
             transformer_dense.tensors,
             temporal_parallel_dims,
             symbol_map_value,
@@ -571,7 +583,8 @@ def main():
 
         print("Dense model: reading out")
         distributed_chakra_graph_dense = _postprocess_chakra_graph(
-            distributed_chakra_graph_dense, args, dp, pp
+            distributed_chakra_graph_dense, args, dp, pp,
+            block_to_chunk_local=block_to_chunk_local,
         )
         distributed_chakra_graph_dense.readout(
             generated_filename, backend=ReadoutBackend
@@ -613,7 +626,7 @@ def main():
         spatial_parallel_dims_moe = [dp, tp, spp, ep]
 
         # moe model
-        pipeline_tensor_map = _create_pipeline_tensor_map(
+        pipeline_tensor_map, block_to_chunk_local = _create_pipeline_tensor_map(
             transformer_moe.tensors,
             temporal_parallel_dims,
             symbol_map_value,
@@ -657,7 +670,8 @@ def main():
 
         print("MoE model: reading out")
         distributed_chakra_graph_moe = _postprocess_chakra_graph(
-            distributed_chakra_graph_moe, args, dp, pp
+            distributed_chakra_graph_moe, args, dp, pp,
+            block_to_chunk_local=block_to_chunk_local,
         )
         distributed_chakra_graph_moe.readout(generated_filename, backend=ReadoutBackend)
 

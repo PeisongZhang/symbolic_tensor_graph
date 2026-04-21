@@ -93,18 +93,22 @@ def _tensor_size_bytes(tensor, symbol_map, mixed_precision=False):
 
 
 def _print_gpu_vram(bundle_graph, symbol_map, mixed_precision=False, header="",
-                    activation_recompute=False,
-                    activation_recompute_keep_ratio=0.2):
+                    activation_recompute=False):
     """Report per-rank persistent VRAM.
 
-    When activation_recompute=True, stashed activations per stage drop from
-    "all intermediate activations" to roughly "stage input activation". Paper
-    (Megatron-LM §3.5) gives A_input + l/c * A_intermediate; for the common
-    choice c=1 (checkpoint every layer) only stage inputs stay resident. We
-    model this coarsely by scaling the 'acts' bucket by
-    activation_recompute_keep_ratio (default 0.2, tunable). Precise
-    layer-by-layer tracking is deferred to ASTRA-sim's LocalMemUsageTracker
-    (P3-A).
+    When ``activation_recompute=True`` the activation-kept fraction depends on
+    the checkpoint granularity (Megatron-LM paper formula
+    ``A_input + l/c · A_intermediate``) and on the sharding layout — it cannot
+    be captured by a single hard-coded scalar. Previously this function
+    multiplied the ``act`` bucket by ``keep_ratio=0.2`` which happened to be
+    close to a typical ``c=1, l=8`` stage but was arbitrarily wrong for other
+    shapes and masked P3-A VRAM-cap OK/OVERFLOW decisions.
+
+    Fix (correctness_todo.md §3, path A): when AR is on, still report the
+    pre-recompute ``acts`` number as an *upper bound*, and explicitly direct
+    readers to the authoritative value emitted by ASTRA-sim's
+    ``LocalMemUsageTracker`` (look for ``peak memory usage:`` in the
+    simulator log).
     """
     GiB = 1024**3
     for rank_key, tg in bundle_graph.graphs.items():
@@ -127,14 +131,11 @@ def _print_gpu_vram(bundle_graph, symbol_map, mixed_precision=False, header="",
                 tensor_details.append(
                     (cls, size_b, tensor.id, Tensor.stringfy_shape(tensor.y_shape))
                 )
-        acts_full = stats["act"]
-        if activation_recompute:
-            stats["act"] = int(acts_full * activation_recompute_keep_ratio)
         total = sum(stats.values())
         rk_str = ",".join([f"{d[0]}={d[1]}" for d in rank_key])
         recomp_note = (
-            f" [recomp: acts {acts_full / GiB:.3f}->"
-            f"{stats['act'] / GiB:.3f} @{activation_recompute_keep_ratio}]"
+            " [AR=on: acts shown are pre-recompute upper bound; "
+            "authoritative peak = ASTRA-sim 'peak memory usage']"
             if activation_recompute else ""
         )
         print(
