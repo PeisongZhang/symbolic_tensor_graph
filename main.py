@@ -172,6 +172,192 @@ def _postprocess_chakra_graph(chakra_graph, args, dp, pp, block_to_chunk_local=N
     return chakra_graph
 
 
+def _validate_args(args):
+    """Centralized parallelism / shape validation.
+
+    Run once immediately after argparse so all violations are reported
+    together before any output dirs are created or symbol maps are built.
+    """
+    errors = []
+
+    # 1) parallel-degree positivity
+    for name in ("dp", "tp", "pp", "sp", "ep"):
+        v = getattr(args, name)
+        if v < 1:
+            errors.append(f"--{name} must be >= 1 (got {v})")
+    if args.num_iterations < 1:
+        errors.append(f"--num_iterations must be >= 1 (got {args.num_iterations})")
+    if args.dp_local_sgd_interval < 1:
+        errors.append(
+            f"--dp_local_sgd_interval must be >= 1 (got {args.dp_local_sgd_interval})"
+        )
+    if args.pipeline_virtual_stages < 1:
+        errors.append(
+            f"--pipeline_virtual_stages must be >= 1 "
+            f"(got {args.pipeline_virtual_stages})"
+        )
+
+    # 2) effective TP for shape divisibility.
+    #    Dense / GPT / Llama paths fold ep into tp at distribution time
+    #    (main.py: symbol_map_value[tp] *= symbol_map_value[ep]).
+    #    MoE keeps ep separate (it shards the experts dim, not the hidden dim).
+    if args.model_type in ("dense", "llama", "gpt"):
+        eff_tp = args.tp * args.ep
+        eff_tp_label = (
+            f"tp ({args.tp})"
+            if args.ep == 1
+            else f"tp*ep ({args.tp}*{args.ep}={eff_tp})"
+        )
+    else:
+        eff_tp = args.tp
+        eff_tp_label = f"tp ({args.tp})"
+
+    if eff_tp >= 1:
+        if args.head % eff_tp != 0:
+            errors.append(
+                f"--head ({args.head}) must be divisible by {eff_tp_label}"
+            )
+        if args.kvhead % eff_tp != 0:
+            errors.append(
+                f"--kvhead ({args.kvhead}) must be divisible by {eff_tp_label} "
+                "(GQA: kv heads are not replicated across TP ranks)"
+            )
+        if args.dmodel % eff_tp != 0:
+            errors.append(
+                f"--dmodel ({args.dmodel}) must be divisible by {eff_tp_label}"
+            )
+        if args.dff % eff_tp != 0:
+            errors.append(
+                f"--dff ({args.dff}) must be divisible by {eff_tp_label}"
+            )
+    if args.head < 1:
+        errors.append(f"--head must be >= 1 (got {args.head})")
+    elif args.dmodel % args.head != 0:
+        errors.append(
+            f"--dmodel ({args.dmodel}) must be divisible by --head ({args.head}) "
+            "(head_dim = dmodel/head must be a positive integer)"
+        )
+
+    # 3) Pipeline-parallel layer divisibility
+    if args.num_stacks < 1:
+        errors.append(f"--num_stacks must be >= 1 (got {args.num_stacks})")
+    elif args.num_stacks < args.pp:
+        errors.append(
+            f"--num_stacks ({args.num_stacks}) must be >= --pp ({args.pp})"
+        )
+    elif args.num_stacks % args.pp != 0:
+        errors.append(
+            f"--num_stacks ({args.num_stacks}) must be divisible by --pp ({args.pp})"
+        )
+    if args.pipeline_virtual_stages > 1 and args.num_stacks % (
+        args.pipeline_virtual_stages * args.pp
+    ) != 0:
+        errors.append(
+            f"--num_stacks ({args.num_stacks}) must be divisible by "
+            f"--pipeline_virtual_stages * --pp "
+            f"({args.pipeline_virtual_stages}*{args.pp}="
+            f"{args.pipeline_virtual_stages * args.pp}) when v > 1"
+        )
+
+    # 4) Pipeline schedule / virtual-stage consistency
+    if args.pipeline_schedule == "1f1b-interleaved" and \
+       args.pipeline_virtual_stages <= 1:
+        errors.append(
+            "--pipeline_schedule=1f1b-interleaved requires "
+            "--pipeline_virtual_stages > 1"
+        )
+    if args.pipeline_virtual_stages > 1 and \
+       args.pipeline_schedule != "1f1b-interleaved":
+        # Non-fatal: virtual stages are honored only under 1f1b-interleaved.
+        print(
+            f"[validate][warn] --pipeline_virtual_stages="
+            f"{args.pipeline_virtual_stages} > 1 has no effect under "
+            f"--pipeline_schedule={args.pipeline_schedule}; use "
+            "1f1b-interleaved to enable interleaved (VPP) execution."
+        )
+
+    # 5) Sequence-parallel divisibility (only meaningful when sp > 1)
+    if args.sp > 1 and args.seq % args.sp != 0:
+        errors.append(
+            f"--seq ({args.seq}) must be divisible by --sp ({args.sp})"
+        )
+
+    # 6) Batch divisibility (mirrors the existing post-defaulting check;
+    #    handles both micro_batch=-1 (auto) and explicit values).
+    if args.micro_batch == -1:
+        if args.dp >= 1 and args.batch % args.dp != 0:
+            errors.append(
+                f"--batch ({args.batch}) must be divisible by --dp ({args.dp}) "
+                "when --micro_batch is left at its default (-1)"
+            )
+    elif args.micro_batch < 1:
+        errors.append(
+            f"--micro_batch must be >= 1 or -1 (got {args.micro_batch})"
+        )
+    elif args.dp >= 1 and args.batch % (args.micro_batch * args.dp) != 0:
+        errors.append(
+            f"--batch ({args.batch}) must be divisible by "
+            f"--micro_batch * --dp ({args.micro_batch}*{args.dp}="
+            f"{args.micro_batch * args.dp})"
+        )
+
+    # 7) MoE-specific constraints
+    if args.model_type == "moe":
+        if args.experts < 1:
+            errors.append(f"--experts ({args.experts}) must be >= 1 for MoE")
+        if args.kexperts < 1:
+            errors.append(f"--kexperts ({args.kexperts}) must be >= 1 for MoE")
+        if args.experts >= 1 and args.experts % args.ep != 0:
+            errors.append(
+                f"--experts ({args.experts}) must be divisible by --ep ({args.ep})"
+            )
+        if args.kexperts > args.experts:
+            errors.append(
+                f"--kexperts ({args.kexperts}) must be <= --experts ({args.experts})"
+            )
+        if not args.tpsp:
+            errors.append("--tpsp must be true for --model_type=moe")
+
+    # 8) FlashAttention / attention_backend compatibility
+    if args.flash_attention and args.attention_backend not in ("auto", "flash"):
+        errors.append(
+            f"--flash_attention=true is incompatible with "
+            f"--attention_backend={args.attention_backend}"
+        )
+
+    # 9) scatter_gather_optimization is a no-op when tp == 1 (warn only)
+    if args.scatter_gather_optimization and args.tp <= 1:
+        print(
+            "[validate][warn] --scatter_gather_optimization=true has no effect "
+            "when --tp <= 1 (Megatron §4.1 only applies across tensor-parallel ranks)."
+        )
+
+    if errors:
+        msg = "Argument validation failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise ValueError(msg)
+
+    # Visibility: print a one-line summary so the chosen layout is logged.
+    total = args.dp * args.tp * args.pp * args.sp * args.ep
+    if args.model_type == "moe":
+        print(
+            f"[validate] OK | total NPUs = dp({args.dp})*tp({args.tp})*"
+            f"pp({args.pp})*sp({args.sp})*ep({args.ep}) = {total}"
+        )
+    elif args.ep > 1:
+        print(
+            f"[validate] OK | total NPUs = dp({args.dp})*tp({args.tp})*"
+            f"pp({args.pp})*sp({args.sp})*ep({args.ep}) = {total} "
+            "(dense path: ep folded into tp at distribution)"
+        )
+    else:
+        print(
+            f"[validate] OK | total NPUs = dp({args.dp})*tp({args.tp})*"
+            f"pp({args.pp})*sp({args.sp}) = {total}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -309,28 +495,7 @@ def main():
     )
 
     args = parser.parse_args()
-    if args.num_iterations < 1:
-        raise ValueError("--num_iterations must be at least 1")
-    if args.dp_local_sgd_interval < 1:
-        raise ValueError("--dp_local_sgd_interval must be at least 1")
-    if args.pipeline_virtual_stages < 1:
-        raise ValueError("--pipeline_virtual_stages must be at least 1")
-    # Divisibility is only strictly required for clean interleaved scheduling.
-    # v=1 (contiguous mapping) tolerates remainders, matching legacy behavior.
-    if args.pipeline_virtual_stages > 1 and \
-       args.num_stacks % (args.pipeline_virtual_stages * args.pp) != 0:
-        raise ValueError(
-            f"--num_stacks ({args.num_stacks}) must be divisible by "
-            f"--pipeline_virtual_stages ({args.pipeline_virtual_stages}) * "
-            f"--pp ({args.pp}) = "
-            f"{args.pipeline_virtual_stages * args.pp} "
-            "when using interleaved pipeline (v > 1)"
-        )
-    if args.flash_attention and args.attention_backend not in ("auto", "flash"):
-        raise ValueError(
-            "--flash_attention true cannot be combined with --attention_backend "
-            f"{args.attention_backend}"
-        )
+    _validate_args(args)
 
     attention_backend = args.attention_backend
     if attention_backend == "auto":
@@ -359,18 +524,9 @@ def main():
     )
     # --micro_batch is per-rank (Megatron convention). One iteration produces
     # batch // (micro_batch * dp) micro-batches. Default -1 -> no grad accum.
+    # All divisibility checks live in _validate_args.
     if args.micro_batch == -1:
-        if args.batch % args.dp != 0:
-            raise ValueError(
-                f"--batch ({args.batch}) must be divisible by --dp ({args.dp}) "
-                "when --micro_batch is left at its default"
-            )
         args.micro_batch = args.batch // args.dp
-    if args.batch % (args.micro_batch * args.dp) != 0:
-        raise ValueError(
-            f"--batch ({args.batch}) must be divisible by "
-            f"--micro_batch ({args.micro_batch}) * --dp ({args.dp})"
-        )
     # The graph still uses the symbolic shape `Batch/dp` per rank. After
     # MicroBatchReplicator substitutes Batch -> MicroBatch, each replicated
     # micro-batch graph evaluates to args.micro_batch samples per rank, which
